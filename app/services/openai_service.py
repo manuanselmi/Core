@@ -1,32 +1,37 @@
 import os
-import shelve
-from dotenv import load_dotenv
 from openai import OpenAI, NotFoundError
+USE_DB_THREADS = os.getenv("USE_SUPABASE_THREADS", "1") == "1"
 
-
-# 1) Cargo .env para API keys
-load_dotenv()
-
-# 2) Inicializo el cliente y la constante de Assistant
 client = OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
 ASSISTANT_ID = os.getenv("OPENAI_ASSISTANT_ID")
 
+if USE_DB_THREADS:
+    from app.services.threads_service import get_thread, set_thread
+
 def _thread_for(wa_id: str) -> str:
-    """
-    Devuelve el thread_id para ese usuario, creándolo si no existe.
-    Usa shelve en local; en producción cambialo por tu BD/Redis.
-    """
-    shelf_path = os.getenv("THREADS_DB", "/opt/render/project/src/threads_db")
-    with shelve.open(shelf_path, writeback=True) as db:
-        tid = db.get(wa_id)
+    if USE_DB_THREADS:
+        tid = get_thread(wa_id)
         if tid:
-            # Verificar que el thread todavía exista
             try:
                 client.beta.threads.retrieve(tid)
                 return tid
             except NotFoundError:
-                pass  # caemos a recrear
-        # Crear nuevo y actualizar mapping
+                pass
         th = client.beta.threads.create()
-        db[wa_id] = th.id
+        set_thread(wa_id, th.id)
         return th.id
+    else:
+        # fallback (legacy shelve)
+        import shelve
+        shelf_path = os.getenv("THREADS_DB", "/tmp/threads_db")
+        with shelve.open(shelf_path, writeback=True) as dbs:
+            tid = dbs.get(wa_id)
+            if tid:
+                try:
+                    client.beta.threads.retrieve(tid)
+                    return tid
+                except NotFoundError:
+                    pass
+            th = client.beta.threads.create()
+            dbs[wa_id] = th.id
+            return th.id

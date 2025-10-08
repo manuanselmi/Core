@@ -72,26 +72,6 @@
     {
       "type": "function",
       "function": {
-        "name": "create_grocery_list",
-        "description": "Convierte la petición del usuario en una lista de productos para ir al supermercado.",
-        "strict": true,
-        "parameters": {
-          "type": "object",
-          "properties": {
-            "items": {
-              "type": "array",
-              "description": "Listado limpio de productos en singular, sin comentarios adicionales.",
-              "items": { "type": "string" }
-            }
-          },
-          "required": ["items"],
-          "additionalProperties": false
-        }
-      }
-    },
-    {
-      "type": "function",
-      "function": {
         "name": "notify_creators",
         "description": "Se llama cuando el usuario quiere que el bot avise a sus creadores o desarrolladores.",
         "strict": true,
@@ -142,75 +122,6 @@
             "duration_minutes": { "type": "integer", "description": "Duración (min)", "default": 60 }
           },
           "required": ["date", "title"],
-          "additionalProperties": false
-        }
-      }
-    },
-    {
-      "type": "function",
-      "function": {
-        "name": "create_habit",
-        "description": "Crea un nuevo hábito.",
-        "strict": true,
-        "parameters": {
-          "type": "object",
-          "properties": {
-            "name": {
-              "type": "string",
-              "description": "Nombre corto del hábito (ej. “Tomar agua”)."
-            },
-            "recordatorio_horas": {
-              "type": "integer",
-              "description": "Hora preferida para consultarle si cumplió (0-23)."
-            }
-          },
-          "required": ["name", "recordatorio_horas"],
-          "additionalProperties": false
-        }
-      }
-    },
-    {
-      "type": "function",
-      "function": {
-        "name": "delete_habit",
-        "description": "Desactiva o elimina un hábito existente.",
-        "strict": true,
-        "parameters": {
-          "type": "object",
-          "properties": {
-            "name": { "type": "string", "description": "Nombre exacto del hábito a eliminar." }
-          },
-          "required": ["name"],
-          "additionalProperties": false
-        }
-      }
-    },
-    {
-      "type": "function",
-      "function": {
-        "name": "list_habits",
-        "description": "Devuelve el listado de hábitos (activos/inactivos) del usuario.",
-        "strict": true,
-        "parameters": {
-          "type": "object",
-          "properties": {},
-          "required": [],
-          "additionalProperties": false
-        }
-      }
-    },
-    {
-      "type": "function",
-      "function": {
-        "name": "reactivate_habit",
-        "description": "Reactiva un hábito previamente desactivado.",
-        "strict": true,
-        "parameters": {
-          "type": "object",
-          "properties": {
-            "name": { "type": "string", "description": "Nombre exacto del hábito." }
-          },
-          "required": ["name"],
           "additionalProperties": false
         }
       }

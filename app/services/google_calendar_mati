@@ -1,0 +1,192 @@
+from __future__ import annotations
+
+from datetime import datetime, timedelta
+from typing import Optional
+from zoneinfo import ZoneInfo
+
+from flask import current_app
+from google.oauth2 import service_account
+from googleapiclient.discovery import build
+from googleapiclient.errors import HttpError
+
+# Scopes de escritura (puede ser "…/calendar.events"; uso el "…/calendar" para cubrir todo)
+SCOPES = ["https://www.googleapis.com/auth/calendar"]
+
+
+def _build_calendar_service():
+    """
+    Construye el cliente de Calendar con Service Account.
+    Si GOOGLE_DELEGATED_USER está seteado, hace domain-wide delegation.
+    """
+    sa_path = current_app.config["GOOGLE_SERVICE_ACCOUNT_FILE"]
+    delegated_user = current_app.config.get("GOOGLE_DELEGATED_USER")
+
+    creds = service_account.Credentials.from_service_account_file(
+        sa_path, scopes=SCOPES
+    )
+    if delegated_user:
+        creds = creds.with_subject(delegated_user)
+
+    # cache_discovery=False evita warnings/problemas en entornos serverless
+    return build("calendar", "v3", credentials=creds, cache_discovery=False)
+
+
+def _assert_calendar_access(service, calendar_id: str):
+    """
+    Verifica que el 'usuario' (SA o delegado) tenga el calendario en su lista.
+    Si no, 404/403 => PermissionError con mensaje accionable.
+    """
+    try:
+        service.calendarList().get(calendarId=calendar_id).execute()
+    except HttpError as e:
+        status = getattr(e, "status_code", None) or getattr(getattr(e, "resp", None), "status", None)
+        if status in (404, 403):
+            raise PermissionError(
+                f"No hay acceso suficiente al calendario '{calendar_id}'. "
+                "Compartí el calendario con la Service Account con rol 'Realizar cambios en eventos' "
+                "o configurá GOOGLE_DELEGATED_USER para delegación sobre un usuario."
+            ) from e
+        raise
+
+
+def _resolve_calendar_id(
+    explicit_calendar_id: Optional[str],
+    wa_id: Optional[str],
+) -> str:
+    """
+    Selecciona el calendarId a usar:
+    1) Si se pasa explícito, gana ese.
+    2) Si wa_id coincide con SPECIAL_WAID, usa GOOGLE_CALENDAR_ID_SPECIAL.
+    3) Caso contrario, usa GOOGLE_CALENDAR_ID (o 'primary').
+    """
+    if explicit_calendar_id:
+        return explicit_calendar_id
+
+    special_waid = (current_app.config.get("SPECIAL_WAID") or "").strip()
+    special_cal = (current_app.config.get("GOOGLE_CALENDAR_ID_SPECIAL") or "").strip()
+    default_cal = (current_app.config.get("GOOGLE_CALENDAR_ID") or "primary").strip()
+
+    if wa_id and special_waid and special_cal and wa_id.strip() == special_waid:
+        return special_cal
+
+    return default_cal
+
+
+def insert_event(
+    summary: str,
+    start_dt: datetime,
+    end_dt: datetime,
+    tz: str = "America/Montevideo",
+    calendar_id: Optional[str] = None,
+    **kwargs,
+) -> dict:
+    """
+    Inserta un evento. Si 'calendar_id' es None, usa el ruteo por SPECIAL_WAID (ver insert_event_for_wa).
+    kwargs soportados: description, location, attendees (lista de dicts email=...), reminders (dict).
+    """
+    service = _build_calendar_service()
+    # Si no vino calendar_id aquí, no sabemos el wa_id ⇒ usamos el default sin ruteo
+    cal_id = calendar_id or _resolve_calendar_id(None, None)
+
+    # Validación temprana de acceso para distinguir 404 por ACL vs. inexistente
+    _assert_calendar_access(service, cal_id)
+
+    body = {
+        "summary": summary,
+        "start": {"dateTime": start_dt.astimezone(ZoneInfo(tz)).isoformat()},
+        "end": {"dateTime": end_dt.astimezone(ZoneInfo(tz)).isoformat()},
+        "description": kwargs.get("description"),
+        "location": kwargs.get("location"),
+        "attendees": kwargs.get("attendees"),
+        "reminders": kwargs.get("reminders"),
+    }
+    body = {k: v for k, v in body.items() if v is not None}
+
+    try:
+        return service.events().insert(
+            calendarId=cal_id,
+            body=body,
+            conferenceDataVersion=1,
+            supportsAttachments=True,
+        ).execute()
+    except HttpError as e:
+        status = getattr(e, "status_code", None) or getattr(getattr(e, "resp", None), "status", None)
+        if status in (404, 403):
+            raise PermissionError(
+                f"No se pudo escribir en '{cal_id}'. "
+                "Asegurate de compartir el calendario con la Service Account con permisos de edición "
+                "o de configurar la delegación (GOOGLE_DELEGATED_USER). "
+                f"Scopes en uso: {SCOPES}."
+            ) from e
+        raise
+
+
+def insert_event_for_wa(
+    wa_id: str,
+    summary: str,
+    start_dt: datetime,
+    end_dt: datetime,
+    tz: str = "America/Montevideo",
+    **kwargs,
+) -> dict:
+    """
+    Igual a insert_event, pero rutea según el wa_id:
+    - Si wa_id == SPECIAL_WAID ⇒ GOOGLE_CALENDAR_ID_SPECIAL
+    - Si no ⇒ GOOGLE_CALENDAR_ID (o 'primary')
+    """
+    service = _build_calendar_service()
+    cal_id = _resolve_calendar_id(None, wa_id)
+
+    _assert_calendar_access(service, cal_id)
+
+    body = {
+        "summary": summary,
+        "start": {"dateTime": start_dt.astimezone(ZoneInfo(tz)).isoformat()},
+        "end": {"dateTime": end_dt.astimezone(ZoneInfo(tz)).isoformat()},
+        "description": kwargs.get("description"),
+        "location": kwargs.get("location"),
+        "attendees": kwargs.get("attendees"),
+        "reminders": kwargs.get("reminders"),
+    }
+    body = {k: v for k, v in body.items() if v is not None}
+
+    try:
+        return service.events().insert(
+            calendarId=cal_id,
+            body=body,
+            conferenceDataVersion=1,
+            supportsAttachments=True,
+        ).execute()
+    except HttpError as e:
+        status = getattr(e, "status_code", None) or getattr(getattr(e, "resp", None), "status", None)
+        if status in (404, 403):
+            raise PermissionError(
+                f"No se pudo escribir en '{cal_id}' (wa_id={wa_id}). "
+                "Revisá permisos o delegación."
+            ) from e
+        raise
+
+
+def ping_calendar_write():
+    """
+    Crea un evento de prueba en el calendario por defecto a +5 min.
+    """
+    now = datetime.now(ZoneInfo("America/Montevideo"))
+    return insert_event(
+        summary="Ping de prueba del bot",
+        start_dt=now + timedelta(minutes=5),
+        end_dt=now + timedelta(minutes=35),
+    )
+
+
+def ping_calendar_write_special(wa_id: str):
+    """
+    Crea un evento de prueba ruteado por WAID (útil para validar el calendario especial).
+    """
+    now = datetime.now(ZoneInfo("America/Montevideo"))
+    return insert_event_for_wa(
+        wa_id=wa_id,
+        summary=f"Ping ruteado para {wa_id}",
+        start_dt=now + timedelta(minutes=5),
+        end_dt=now + timedelta(minutes=35),
+    )
