@@ -12,8 +12,13 @@ from app.utils.whatsapp_utils import (
     get_text_message_input,
     get_recordatorio_template_input,
     send_message,
-    transcribe_audio,   # usamos tu helper existente
+    transcribe_audio,  
 )
+from app.config.secrets_loader import load_into_env
+load_into_env()
+scheduler_service.init_scheduler(APP)   # fija TZ y contexto para jobs
+
+from app.config.settings import SETTINGS
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Bootstrapping (cold start)
@@ -21,7 +26,7 @@ from app.utils.whatsapp_utils import (
 
 APP = Flask(__name__)
 
-DB_URL = os.getenv("DATABASE_URL") or os.getenv("SUPABASE_DB_URL")
+DB_URL = os.getenv("DATABASE_URL") or os.getenv("SUPABASE_DB_URL" or os.getenv("SUPABASE_URL"))
 if not DB_URL:
     raise RuntimeError("Falta DATABASE_URL / SUPABASE_DB_URL en variables/env/secrets.")
 
