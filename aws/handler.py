@@ -16,7 +16,6 @@ from app.utils.whatsapp_utils import (
 )
 from app.config.secrets_loader import load_into_env
 load_into_env()
-scheduler_service.init_scheduler(APP)   # fija TZ y contexto para jobs
 
 from app.config.settings import SETTINGS
 
