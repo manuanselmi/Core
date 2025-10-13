@@ -1,29 +1,16 @@
 from __future__ import annotations
 
-"""
-SchedulerService (EventBridge edition)
---------------------------------------
-Reemplaza APScheduler por un modelo "polling" disparado por EventBridge Scheduler.
-
-- NO mantiene un scheduler en memoria. En su lugar:
-  - `schedule_event_reminder(...)` y `schedule_scheduled_message(...)` sólo persisten en BD.
-  - Un cron de EventBridge invoca la Lambda cada N minutos, que llama a `run_due_jobs()`.
-  - Idempotencia: Reminders se eliminan tras enviar; ScheduledMessage se envían con
-    `ScheduledMessageService.send()` que marca `sent` o `error` y también elimina la fila si corresponde.
-
-Compatibilidad:
-- Se expone un atributo `scheduler` "no-op" con `.add_job()/.get_job()/.remove_job()`
-  para no romper imports/llamadas existentes. Es inofensivo y sólo loguea.
-"""
-
-from datetime import datetime, timedelta, timezone
-from zoneinfo import ZoneInfo
+import os
+import logging
+from datetime import datetime, timezone, timedelta
 from typing import Optional
 
-from flask import current_app as app
+from flask import current_app
+from zoneinfo import ZoneInfo
 from sqlalchemy import select
+from sqlalchemy.orm import Session
 
-from app.models import db, Reminder, Customer, ScheduledMessage
+from app.models import db, ScheduledMessage, Reminder, Customer
 from app.services.scheduled_message_service import ScheduledMessageService
 from app.utils.whatsapp_utils import (
     get_event_reminder_template_input,
@@ -31,11 +18,15 @@ from app.utils.whatsapp_utils import (
 )
 
 # ────────────────────────────────────────────────────────────────────
-# Globals
+# Config & Globals
 # ────────────────────────────────────────────────────────────────────
 
-LOCAL_TZ = ZoneInfo(app.config.get("TZ", "America/Montevideo")) if app else ZoneInfo("America/Montevideo")
-_app = None  # se setea en init_scheduler()
+_app = None          # se setea en init_scheduler(app)
+_initialized = False
+
+# Parametrizable por env
+BATCH_LIMIT = int(os.getenv("SCHED_BATCH_LIMIT", "100"))
+LOCAL_TZ_NAME = os.getenv("TZ", "America/Montevideo")
 
 
 class _NoopScheduler:
@@ -51,51 +42,58 @@ class _NoopScheduler:
         if _app:
             _app.logger.debug("[NoopScheduler] remove_job(%s) ignorado", job_id)
 
+
 # Atributo público para mantener compat
 scheduler = _NoopScheduler()
 
 
 # ────────────────────────────────────────────────────────────────────
-# Init / Boot
+# Boot
 # ────────────────────────────────────────────────────────────────────
 
-def init_scheduler(app_):
-    """Compat: guarda `app` y fija TZ. No arranca nada en memoria."""
-    global _app, LOCAL_TZ
-    _app = app_
-    LOCAL_TZ = ZoneInfo(_app.config.get("TZ", "America/Montevideo"))
+def init_scheduler(app):
+    """
+    Compat: guarda la referencia de app y fija TZ.
+    En AWS NO se inicia ningún thread ni APScheduler.
+    """
+    global _app, _initialized
+    _app = app
+    _initialized = True
+    tz = ZoneInfo(LOCAL_TZ_NAME)
     if _app:
-        _app.logger.info("[SchedulerService] (EventBridge) iniciado. TZ=%s", LOCAL_TZ)
-    return scheduler  # por compat (quien lo llame puede ignorarlo)
+        _app.logger.info("[SchedulerService] (EventBridge) iniciado. TZ=%s", tz)
+    return scheduler
 
 
-def reschedule_all_on_boot():
-    """
-    Compat: antes reprogramábamos todos los jobs en el arranque del proceso.
-    Con EventBridge ya NO es necesario. Dejamos el hook por si algún módulo lo invoca.
-    """
-    if _app:
-        _app.logger.info("[SchedulerService] reschedule_all_on_boot(): no-op (EventBridge).")
-
-
-# ────────────────────────────────────────────────────────────────────
-# API de programación
-# ────────────────────────────────────────────────────────────────────
-
-def schedule_event_reminder(
-    _ignored_scheduler: _NoopScheduler,   # compat con firma legacy
-    reminder_id: int,
-    advance: timedelta = timedelta(minutes=1),
-) -> None:
-    """
-    Prepara el envío del recordatorio:
-      - (Opcional) «pre-aviso» `advance` antes (como ScheduledMessage de texto).
-      - Notificación en hora: se resuelve en `run_due_jobs()` (lee `reminders` vencidos).
-    """
-    if _app is None:
+def _require_app():
+    if not _initialized or _app is None:
         raise RuntimeError("SchedulerService no iniciado. Llama init_scheduler(app)")
+    return _app
 
-    with _app.app_context():
+
+# ────────────────────────────────────────────────────────────────────
+# Helpers
+# ────────────────────────────────────────────────────────────────────
+
+def _now_utc() -> datetime:
+    return datetime.now(timezone.utc)
+
+
+def _now_local() -> datetime:
+    return datetime.now(ZoneInfo(LOCAL_TZ_NAME))
+
+
+# ────────────────────────────────────────────────────────────────────
+# API de programación (compat)
+# ────────────────────────────────────────────────────────────────────
+
+def schedule_event_reminder(_ignored_scheduler, reminder_id: int, advance: timedelta = timedelta(minutes=1)) -> None:
+    """
+    Persiste lo necesario en BD; el envío real lo hará run_due_jobs().
+    - (Opcional) genera un ScheduledMessage de 'pre-aviso' si corresponde.
+    """
+    app = _require_app()
+    with app.app_context():
         rem: Reminder | None = (
             db.session.query(Reminder)
             .join(Customer)
@@ -105,47 +103,33 @@ def schedule_event_reminder(
         if not rem:
             return
 
-        # Normalizar fecha a TZ local
+        local_tz = ZoneInfo(LOCAL_TZ_NAME)
         rdt = rem.date
-        if rdt.tzinfo is None:
-            rdt_local = rdt.replace(tzinfo=LOCAL_TZ)
-        else:
-            rdt_local = rdt.astimezone(LOCAL_TZ)
+        rdt_local = rdt.replace(tzinfo=local_tz) if rdt.tzinfo is None else rdt.astimezone(local_tz)
 
-        # Programar pre-aviso como ScheduledMessage (texto simple)
         if advance and advance.total_seconds() > 0:
-            pre_dt = rdt_local - advance
-            now_local = datetime.now(LOCAL_TZ)
-            if pre_dt > now_local:
+            pre_dt_local = rdt_local - advance
+            if pre_dt_local > _now_local():
                 text = f"⏰ Recordatorio próximo: «{rem.titulo}» a las {rdt_local.strftime('%H:%M')}."
                 ScheduledMessageService.create(
                     customer_id=rem.customer_id,
                     target_phone=rem.customer.phone,
                     text=text,
-                    send_at=pre_dt.astimezone(timezone.utc),
+                    send_at=pre_dt_local.astimezone(timezone.utc),
                 )
-                # NOTA: no generamos un job; EventBridge hará polling y enviará.
 
 
-def schedule_scheduled_message(
-    _ignored_scheduler: _NoopScheduler,
-    sm_id: int,
-    send_at: datetime,
-) -> None:
+def schedule_scheduled_message(_ignored_scheduler, sm_id: int, send_at: datetime) -> None:
     """
-    Compat: asegura que el ScheduledMessage existe con `send_at` esperado.
-    El envío lo hará `run_due_jobs()` cuando venza.
+    Asegura la fecha esperada; el envío lo hará run_due_jobs().
     """
-    if _app is None:
-        raise RuntimeError("SchedulerService no iniciado. Llama init_scheduler(app)")
-
-    with _app.app_context():
+    app = _require_app()
+    with app.app_context():
         sm = db.session.get(ScheduledMessage, sm_id)
         if not sm:
             return
-        # Normalizamos a UTC para comparación/consistencia
         if send_at.tzinfo is None:
-            send_at = send_at.replace(tzinfo=LOCAL_TZ).astimezone(timezone.utc)
+            send_at = send_at.replace(tzinfo=ZoneInfo(LOCAL_TZ_NAME)).astimezone(timezone.utc)
         else:
             send_at = send_at.astimezone(timezone.utc)
 
@@ -155,10 +139,9 @@ def schedule_scheduled_message(
 
 
 def cancel_scheduled_message(sm_id: int) -> bool:
-    """Elimina el registro: al no existir, no será enviado por `run_due_jobs()`."""
-    if _app is None:
-        raise RuntimeError("SchedulerService no iniciado. Llama init_scheduler(app)")
-    with _app.app_context():
+    """Eliminar de BD (si no existe, no se enviará)."""
+    app = _require_app()
+    with app.app_context():
         sm = db.session.get(ScheduledMessage, sm_id)
         if not sm:
             return False
@@ -168,89 +151,115 @@ def cancel_scheduled_message(sm_id: int) -> bool:
 
 
 # ────────────────────────────────────────────────────────────────────
-# Loop de ejecución invocado por EventBridge
+# Claim & Send (idempotente, concurrente-safe)
 # ────────────────────────────────────────────────────────────────────
 
-def _send_due_scheduled_messages(now_utc: datetime) -> int:
-    """Envia ScheduledMessage pendientes (<= now_utc)."""
-    # Selección conservadora: hasta 100 por tirada para evitar picos.
-    # (Si necesitás más, hacemos batch + paginación)
-    pending: list[ScheduledMessage] = (
-        db.session.query(ScheduledMessage)
-        .filter(ScheduledMessage.status == "pending",
-                ScheduledMessage.send_at <= now_utc)
+def _claim_pending_scheduled_messages(sess: Session, now_utc: datetime, limit: int) -> list[ScheduledMessage]:
+    """
+    Toma en exclusiva (SKIP LOCKED) un batch de mensajes pendientes.
+    Evita doble envío si hay dos Lambdas corriendo en paralelo.
+    """
+    # Bloqueamos filas PENDING con send_at vencido
+    q = (
+        select(ScheduledMessage)
+        .where(ScheduledMessage.status == "pending", ScheduledMessage.send_at <= now_utc)
         .order_by(ScheduledMessage.send_at.asc())
-        .limit(100)
-        .all()
+        .limit(limit)
+        .with_for_update(skip_locked=True)
     )
+    rows = sess.execute(q).scalars().all()
+    # Marcamos 'sending' en la misma transacción
+    for r in rows:
+        r.status = "sending"
+        r.claimed_at = now_utc
+    return rows
+
+
+def _process_scheduled_messages(sess: Session, rows: list[ScheduledMessage], now_utc: datetime) -> int:
     sent = 0
-    for sm in pending:
+    for sm in rows:
         try:
-            ScheduledMessageService.send(sm.id)
+            ScheduledMessageService.send(sm.id)  # se encarga de construir y enviar
+            sm.status = "sent"
+            sm.sent_at = now_utc
             sent += 1
         except Exception:
-            # ScheduledMessageService ya marca error; seguimos con el siguiente
-            if _app:
-                _app.logger.exception("[SchedulerService] Error enviando ScheduledMessage id=%s", sm.id)
+            logging.exception("[SchedulerService] Error enviando ScheduledMessage id=%s", sm.id)
+            sm.status = "error"
+            sm.error_at = now_utc
     return sent
 
 
-def _send_due_reminders(now_local: datetime) -> int:
+def _claim_due_reminders(sess: Session, now_local: datetime, limit: int) -> list[Reminder]:
     """
-    Envía notificaciones de recordatorios cuya `date` ≤ now_local.
-    - Si la fecha es naive, se asume `LOCAL_TZ`.
-    - Idempotencia: se elimina la fila tras enviar.
+    Selecciona recordatorios vencidos. Usamos SKIP LOCKED via select+delete por ítem.
+    Si tu tabla crece, agregá índice por `date`.
     """
-    # Traemos un subset cercano (±1 día) para minimizar scanning si crecen tablas.
-    # Si tus volúmenes crecen, mover a condición por rangos + índices.
-    approx_start = now_local - timedelta(days=1)
-    approx_end   = now_local + timedelta(minutes=1)
-
-    reminders: list[Reminder] = (
-        db.session.query(Reminder)
+    q = (
+        select(Reminder)
         .join(Customer)
-        .filter(Reminder.date >= approx_start.replace(tzinfo=None),  # naive compare
-                Reminder.date <= approx_end.replace(tzinfo=None))
-        .all()
+        .order_by(Reminder.date.asc())
+        .limit(limit)
+        .with_for_update(skip_locked=True)
     )
-
-    sent = 0
-    for r in reminders:
-        # Verificación precisa en tz local
+    candidates = sess.execute(q).scalars().all()
+    due: list[Reminder] = []
+    local_tz = ZoneInfo(LOCAL_TZ_NAME)
+    for r in candidates:
         rdt = r.date
-        rdt_local = rdt.replace(tzinfo=LOCAL_TZ) if rdt.tzinfo is None else rdt.astimezone(LOCAL_TZ)
+        rdt_local = rdt.replace(tzinfo=local_tz) if rdt.tzinfo is None else rdt.astimezone(local_tz)
         if rdt_local <= now_local:
-            try:
-                payload = get_event_reminder_template_input(
-                    recipient=r.customer.phone,
-                    titulo=r.titulo,
-                )
-                send_message(payload)
-                db.session.delete(r)
-                db.session.commit()
-                sent += 1
-            except Exception:
-                if _app:
-                    _app.logger.exception("[SchedulerService] Error enviando Reminder id=%s", r.id)
+            due.append(r)
+    return due
+
+
+def _process_reminders(sess: Session, rows: list[Reminder]) -> int:
+    sent = 0
+    for r in rows:
+        try:
+            payload = get_event_reminder_template_input(
+                recipient=r.customer.phone,
+                titulo=r.titulo,
+            )
+            send_message(payload)
+            sess.delete(r)  # idempotencia: no vuelve a aparecer en próximas corridas
+            sent += 1
+        except Exception:
+            logging.exception("[SchedulerService] Error enviando Reminder id=%s", r.id)
     return sent
 
+
+# ────────────────────────────────────────────────────────────────────
+# Entry point ejecutado por EventBridge
+# ────────────────────────────────────────────────────────────────────
 
 def run_due_jobs() -> dict:
     """
-    Punto único que debería invocar la Lambda cuando `event['source']=='aws.events'`.
-    Retorna métricas simples para logging/CloudWatch.
+    Llamar sólo cuando la invocación provenga de EventBridge.
+    Retorna métricas simples para logs/CloudWatch.
     """
-    if _app is None:
-        raise RuntimeError("SchedulerService no iniciado. Llama init_scheduler(app)")
+    app = _require_app()
+    now_utc = _now_utc()
+    now_local = _now_local()
 
-    now_utc = datetime.now(timezone.utc)
-    now_local = datetime.now(LOCAL_TZ)
+    with app.app_context():
+        # Usamos una única sesión/tx por batch para reducir round-trips
+        # 1) Scheduled Messages
+        with db.session.begin():
+            rows_sm = _claim_pending_scheduled_messages(db.session, now_utc, BATCH_LIMIT)
+        # Fuera del "claim" (liberamos locks), procesamos y persistimos resultado
+        with db.session.begin():
+            sent_msgs = _process_scheduled_messages(db.session, rows_sm, now_utc)
 
-    with _app.app_context():
-        sent_msgs = _send_due_scheduled_messages(now_utc)
-        sent_rem  = _send_due_reminders(now_local)
+        # 2) Reminders
+        with db.session.begin():
+            rows_rem = _claim_due_reminders(db.session, now_local, BATCH_LIMIT)
+            sent_rem = _process_reminders(db.session, rows_rem)
 
-    if _app:
-        _app.logger.info("[SchedulerService] run_due_jobs: scheduled=%s, reminders=%s", sent_msgs, sent_rem)
+    if app:
+        app.logger.info(
+            "[SchedulerService] run_due_jobs: scheduled_sent=%s, reminders_sent=%s",
+            sent_msgs, sent_rem,
+        )
 
     return {"ok": True, "scheduled_sent": sent_msgs, "reminders_sent": sent_rem}

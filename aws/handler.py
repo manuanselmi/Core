@@ -1,9 +1,12 @@
-import os, json, logging, base64, time
+import os, json, logging, base64, time, sys, io
 from datetime import datetime, timezone, timedelta
 
 # ── Secrets primero (robusto a opcionales) ─────────────────────
 from app.config.secrets_loader import load_into_env
 load_into_env()
+
+sys.stdout = io.TextIOWrapper(sys.stdout.buffer, encoding="utf-8")
+sys.stderr = io.TextIOWrapper(sys.stderr.buffer, encoding="utf-8")
 
 # ── Deps app ───────────────────────────────────────────────────
 import requests
@@ -58,6 +61,8 @@ if not APP.config["PHONE_NUMBER_ID"] or not APP.config["ACCESS_TOKEN"]:
 db.init_app(APP)
 APP.app_context().push()
 
+scheduler_service.init_scheduler(APP)
+
 logging.getLogger().setLevel(logging.INFO)
 logger = logging.getLogger(__name__)
 
@@ -73,6 +78,14 @@ ACCESS_TOKEN = APP.config["ACCESS_TOKEN"]
 # ─────────────────────────────────────────────────────────────────────────────
 # Helpers
 # ─────────────────────────────────────────────────────────────────────────────
+
+def _is_eventbridge(evt: dict) -> bool:
+    """Verdadero si la invocación viene de EventBridge Scheduler."""
+    return (
+        evt.get("source") == "aws.events"
+        or evt.get("detail-type") == "scheduled-job"
+        or evt.get("agentMode") == "job"
+   )
 
 def _msg_already_processed(wamid: str) -> bool:
     if not wamid:
@@ -203,9 +216,13 @@ def _extract_value(data: dict) -> tuple[dict, dict, dict] | None:
 
 def lambda_handler(event, context):
     # 0) Invocación de EventBridge → correr jobs pendientes
-    if event.get("source") == "aws.events":
+    if _is_eventbridge(event):
         out = scheduler_service.run_due_jobs()
-        return {"statusCode": 200, "body": json.dumps(out, ensure_ascii=False)}
+        return {
+            "statusCode": 200,
+            "headers": {"content-type": "application/json"},
+            "body": json.dumps(out, ensure_ascii=False)
+        }
 
     method, path, qs, raw_body = _parse_http_meta(event)
 

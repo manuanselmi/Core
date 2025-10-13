@@ -56,18 +56,19 @@ class GoogleCalendarService:
     """Wrapper mínimo para *free/busy* y creación de os con ruteo por WAID."""
 
     def __init__(self):
-        if not SERVICE_ACCOUNT_FILE:
-            raise RuntimeError(
-                "⛔ Falta la variable de entorno GOOGLE_SERVICE_ACCOUNT_FILE "
-                "con la ruta al JSON de la cuenta de servicio."
-            )
-
-        creds = service_account.Credentials.from_service_account_file(
-            SERVICE_ACCOUNT_FILE, scopes=SCOPES
-        )
-        # cache_discovery=False evita warnings y problemas de cacheo en serverless
-        self.service = build("calendar", "v3", credentials=creds, cache_discovery=False)
-
+        service_file = os.getenv("GOOGLE_SERVICE_ACCOUNT_FILE")
+        if not service_file:
+            # Feature gate: Google opcional
+            logging.warning("Google Calendar desactivado: falta GOOGLE_SERVICE_ACCOUNT_FILE.")
+            self.client = None
+            return
+        try:
+            self._init_client(service_file)
+        except Exception as e:
+            logging.error(f"Error inicializando GoogleCalendarService: {e}")
+            _logger().error(f"Error inicializando GoogleCalendarService: {e}")
+            self.client = None
+            
     # ---------- Disponibilidad ----------
     def get_free_slots(
         self,

@@ -47,7 +47,19 @@ class Orchestrator:
         self.current_customer_id = None
         self.current_phone = None
         self.current_name = None
-        self.calendar_api = GoogleCalendarService()
+        self.calendar_api = None
+        self.has_calendar = False
+        try:
+            from app.services.google_calendar_service import GoogleCalendarService
+            self.calendar_api = GoogleCalendarService() 
+            self.has_calendar = bool(getattr(self.calendar_api, "client", None))
+        except Exception as e:
+            logging.warning("Calendar deshabilitado o no disponible: %s", e)
+            self.calendar_api = None
+            self.has_calendar = False
+
+        if not self.has_calendar:
+            logging.info("Google Calendar API no inicializada (modo sin Google).")
         self.send_msg_flow = SendMessageFlow()
 
     def handle_message(self, message: str, phone: str, name: str | None, wa_msg_id: str | None):
