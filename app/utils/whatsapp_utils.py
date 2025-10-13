@@ -8,7 +8,6 @@ import re
 from flask import current_app
 from flask import current_app as app
 from app.services.bot_logic import BotLogic
-from app.services.orchestrator import Orchestrator
 from app.models import db, Reminder
 import tempfile
 from app.services.openai_service import client as openai_client
@@ -16,9 +15,17 @@ from app.services.openai_service import client as openai_client
 # Inicializar la lógica de fecha
 g_logic = BotLogic()
 
-# Cliente OpenAI
-client = OpenAI()
-orchestrator = Orchestrator(client, db_session=db.session)
+# --- Lazy helper para evitar circular import ---
+def _cancel_reminder_via_orchestrator(recipient: str, context_id: str | None) -> bool:
+    """
+    Realiza import diferido para no crear ciclos:
+    orchestrator <- scheduler_service <- whatsapp_utils (este módulo).
+    """
+    if not context_id:
+        return False
+    from app.services.orchestrator import Orchestrator
+    orch = Orchestrator(openai_client, db_session=db.session)
+    return orch.cancel_reminder(phone=recipient, context_id=context_id)
 
 
 def get_text_message_input(recipient: str, text: str) -> dict:
@@ -328,9 +335,9 @@ def process_whatsapp_message(body: dict):
             # ▸ Cancelar recordatorio
             if payload == "Cancelar":
                 app.logger.debug("🔕 Usuario solicitó cancelar el recordatorio")
-                cancelled = orchestrator.cancel_reminder(
-                    phone=recipient,
-                    context_id=msg.get("context", {}).get("id", "")
+                cancelled = _cancel_reminder_via_orchestrator(
+                    recipient,
+                    msg.get("context", {}).get("id", "")
                 )
                 text = (
                     "Listo, tu recordatorio ha sido cancelado ❌."
