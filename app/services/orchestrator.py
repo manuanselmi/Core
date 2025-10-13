@@ -25,8 +25,6 @@ from app.services.memory_service import Memory
 from app.utils.datetime_normalizer import normalize_to_future
 import datetime as dt
 from app.models import db, Reminder, Customer, ScheduledMessage
-import psycopg2
-from psycopg2.extras import RealDictCursor
 from app.services.google_calendar_service import CALENDAR_ID, GoogleCalendarService
 from app.services.send_message_flow import SendMessageFlow
 from app.services.openai_service import client, _thread_for, ASSISTANT_ID

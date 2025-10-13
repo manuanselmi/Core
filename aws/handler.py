@@ -34,7 +34,7 @@ DB_URL = (
 if not DB_URL:
     raise RuntimeError("Falta DATABASE_URL / SUPABASE_DB_URL en variables/env/secrets.")
 
-# Normaliza el dialecto para SQLAlchemy + psycopg (v3)
+# Normaliza el dialecto para SQLAlchemy + psycopg (v3) eliminar a futuro, duplicado con el secrets loader
 if DB_URL.startswith("postgres://"):
     DB_URL = "postgresql+psycopg://" + DB_URL[len("postgres://"):]
 else:

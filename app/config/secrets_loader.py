@@ -14,6 +14,18 @@ _SECRET_ENV_MAP = {
     "SM_ARN_GOOGLE_SA": "GOOGLE_SA_JSON",
 }
 
+def _normalize_db_url():
+    db_url = os.getenv("DATABASE_URL") or os.getenv("SQLALCHEMY_DATABASE_URI")
+    if not db_url:
+        return
+    fixed = db_url.strip()
+    if fixed.startswith("postgres://"):
+        fixed = fixed.replace("postgres://", "postgresql://", 1)
+    if fixed.startswith("postgresql://") and "+psycopg" not in fixed:
+        fixed = fixed.replace("postgresql://", "postgresql+psycopg://", 1)
+    os.environ["DATABASE_URL"] = fixed
+    os.environ["SQLALCHEMY_DATABASE_URI"] = fixed
+
 def _is_valid_arn(val: str) -> bool:
     return isinstance(val, str) and bool(_ARN_RE.match(val))
 
@@ -35,3 +47,4 @@ def load_into_env() -> None:
             secret = base64.b64decode(resp["SecretBinary"]).decode("utf-8")
         # Para GOOGLE_SA_JSON guardá el JSON completo como SecretString (ver sección 5)
         os.environ[final_env] = secret
+    _normalize_db_url()
