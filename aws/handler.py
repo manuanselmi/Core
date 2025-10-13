@@ -1,43 +1,56 @@
-# aws/handler.py
 import os, json, logging, base64, time
 from datetime import datetime, timezone, timedelta
 
+# ── Secrets primero (robusto a opcionales) ─────────────────────
+from app.config.secrets_loader import load_into_env
+load_into_env()
+
+# ── Deps app ───────────────────────────────────────────────────
 import requests
 from flask import Flask
+from sqlalchemy.pool import NullPool
+
 from app.models import db, Turn, Reminder, ScheduledMessage, Customer
-from app.services.openai_service import client as openai_client
+from app.services.openai_service import client as openai_client  # ya tiene OPENAI_API_KEY
 from app.services.orchestrator import Orchestrator
 from app.services import scheduler_service
 from app.utils.whatsapp_utils import (
     get_text_message_input,
     get_recordatorio_template_input,
     send_message,
-    transcribe_audio,  
+    transcribe_audio,
 )
-from app.config.secrets_loader import load_into_env
-load_into_env()
-
 from app.config.settings import SETTINGS
 
-# ─────────────────────────────────────────────────────────────────────────────
-# Bootstrapping (cold start)
-# ─────────────────────────────────────────────────────────────────────────────
-
+# ── Bootstrapping ───────────────────────────────────────────────
 APP = Flask(__name__)
 
-DB_URL = os.getenv("DATABASE_URL") or os.getenv("SUPABASE_DB_URL" or os.getenv("SUPABASE_URL"))
+# DB_URL: corrige el "or" mal puesto (Render / Supabase)
+DB_URL = (
+    os.getenv("DATABASE_URL")
+    or os.getenv("SUPABASE_DB_URL")
+    or os.getenv("SUPABASE_URL")
+)
 if not DB_URL:
     raise RuntimeError("Falta DATABASE_URL / SUPABASE_DB_URL en variables/env/secrets.")
 
+# Normaliza el dialecto para SQLAlchemy + psycopg (v3)
+if DB_URL.startswith("postgres://"):
+    DB_URL = "postgresql+psycopg://" + DB_URL[len("postgres://"):]
+else:
+    DB_URL = DB_URL.replace("postgresql://", "postgresql+psycopg://", 1)
+
 APP.config["SQLALCHEMY_DATABASE_URI"] = DB_URL
 APP.config["SQLALCHEMY_TRACK_MODIFICATIONS"] = False
+# Lambda + Render: evitar pools persistentes
+APP.config["SQLALCHEMY_ENGINE_OPTIONS"] = {"poolclass": NullPool}
 
 # Config WhatsApp / Tokens
 APP.config["GRAPH_API_VERSION"] = os.getenv("GRAPH_API_VERSION", "v23.0").lstrip("v")
 APP.config["PHONE_NUMBER_ID"]   = os.getenv("PHONE_NUMBER_ID")
 APP.config["ACCESS_TOKEN"]      = os.getenv("WHATSAPP_ACCESS_TOKEN") or os.getenv("ACCESS_TOKEN")
-VERIFY_TOKEN = os.getenv("WHATSAPP_VERIFY_TOKEN") or os.getenv("VERIFY_TOKEN")
-LOCAL_TZ     = os.getenv("TZ", "America/Montevideo")
+VERIFY_TOKEN                    = os.getenv("WHATSAPP_VERIFY_TOKEN") or os.getenv("VERIFY_TOKEN")
+LOCAL_TZ                        = os.getenv("TZ", "America/Montevideo")
 
 if not APP.config["PHONE_NUMBER_ID"] or not APP.config["ACCESS_TOKEN"]:
     raise RuntimeError("Faltan PHONE_NUMBER_ID y/o WHATSAPP_ACCESS_TOKEN.")
@@ -46,6 +59,7 @@ db.init_app(APP)
 APP.app_context().push()
 
 logging.getLogger().setLevel(logging.INFO)
+logger = logging.getLogger(__name__)
 
 # Orchestrator intacto
 orchestrator = Orchestrator(openai_client, db_session=db.session)
