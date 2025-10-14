@@ -20,9 +20,9 @@ def _word_to_int(token: str) -> int | None:
     token = token.strip().lower()
     if token in _NUM_WORDS: return _NUM_WORDS[token]
     # “veinticinco”, “treintaycinco” (tolerante)
-    m = re.match(r"(veinti|treinta|cuarenta|cincuenta|sesenta|setenta|ochenta|noventa)(y)?(uno|dos|tres|cuatro|cinco|seis|siete|ocho|nueve)", token)
+    m = re.match(r"(veinte|treinta|cuarenta|cincuenta|sesenta|setenta|ochenta|noventa)(y)?(uno|dos|tres|cuatro|cinco|seis|siete|ocho|nueve)", token)
     if m:
-        tens = {"veinti":20,"treinta":30,"cuarenta":40,"cincuenta":50,"sesenta":60,"setenta":70,"ochenta":80,"noventa":90}[m.group(1)]
+        tens = {"veinte":20,"treinta":30,"cuarenta":40,"cincuenta":50,"sesenta":60,"setenta":70,"ochenta":80,"noventa":90}[m.group(1)]
         ones = _NUM_WORDS[m.group(3)]
         return tens + ones
     return None
