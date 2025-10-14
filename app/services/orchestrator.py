@@ -66,7 +66,7 @@ class Orchestrator:
         """
         Entrada principal. Mantengo el flujo original y sólo adapto el scheduling.
         """
-        user = CustomerService.get_or_create_by_phone(phone, name)
+        user = CustomerService.find_or_create(phone, name)
         self.current_customer_id = user.get("id")
         self.current_phone = phone
         self.current_name = name
@@ -162,7 +162,12 @@ class Orchestrator:
         Envía el mensaje al Assistant y devuelve la respuesta
         (o dict si una tool-call ya maneja la salida final).-
         """
-        thread_id = _thread_for(wa_id)
+        thread_id = _thread_for(
+            wa_id,
+            customer_id=getattr(self, "current_customer_id", None),
+            correlation_id=getattr(current_app, "correlation_id", None),
+            last_wa_msg_id=os.getenv("CURRENT_WAMID")  # opcional si lo guardás en contexto
+        )
         
         extra_instr = None
         try:

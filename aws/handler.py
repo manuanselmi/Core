@@ -14,7 +14,10 @@ from flask import Flask
 from sqlalchemy.pool import NullPool
 
 from app.models import db, Turn, Reminder, ScheduledMessage, Customer
-from app.services.openai_service import client as openai_client  # ya tiene OPENAI_API_KEY
+from app.services.threads_service import ensure_thread
+from app.utils.phone_utils import normalize_phone_e164
+from uuid import uuid4
+from app.services.openai_service import client as openai_client 
 from app.services.orchestrator import Orchestrator
 from app.services import scheduler_service
 from app.utils.whatsapp_utils import (
@@ -215,6 +218,14 @@ def _extract_value(data: dict) -> tuple[dict, dict, dict] | None:
 # ─────────────────────────────────────────────────────────────────────────────
 
 def lambda_handler(event, context):
+    # Correlation-ID (propagar a logs y llamadas salientes)
+    headers = (event.get("headers") or {})
+    correlation_id = (
+        headers.get("x-correlation-id")
+        or headers.get("x-amzn-trace-id")
+        or str(uuid4())
+    )
+
     # 0) Invocación de EventBridge → correr jobs pendientes
     if _is_eventbridge(event):
         out = scheduler_service.run_due_jobs()
@@ -226,7 +237,7 @@ def lambda_handler(event, context):
 
     method, path, qs, raw_body = _parse_http_meta(event)
 
-    # 1) GET /webhook → verificación
+    # 1) GET /webhook → verificación (Meta)
     if method == "GET":
         if (qs.get("hub.verify_token") == VERIFY_TOKEN) and qs.get("hub.challenge"):
             return {"statusCode": 200, "body": qs["hub.challenge"]}
@@ -236,12 +247,15 @@ def lambda_handler(event, context):
     try:
         body = json.loads(raw_body or "{}")
     except Exception:
-        logging.exception("[WEBHOOK] body inválido")
+        logging.exception("[WEBHOOK] body inválido", extra={"correlation_id": correlation_id})
         return {"statusCode": 200, "body": "ok"}
 
     result = _extract_value(body)
     if not result:
-        logging.info("[WEBHOOK] Callback sin contacts/messages (statuses u otros)")
+        logging.info(
+            "[WEBHOOK] Callback sin contacts/messages (statuses u otros)",
+            extra={"correlation_id": correlation_id}
+        )
         return {"statusCode": 200, "body": "ok"}
 
     value, contact, msg_obj = result
@@ -258,11 +272,19 @@ def lambda_handler(event, context):
         ts_utc = datetime.now(timezone.utc)
 
     if datetime.now(timezone.utc) - ts_utc > timedelta(minutes=STALE_MINUTES):
-        logging.info("[WEBHOOK] Mensaje %s ignorado por antigüedad (%s UTC)", wamid, ts_utc.isoformat(timespec='seconds'))
+        logging.info(
+            "[WEBHOOK] Mensaje %s ignorado por antigüedad (%s UTC)",
+            wamid, ts_utc.isoformat(timespec='seconds'),
+            extra={"correlation_id": correlation_id, "wa_id": wa_id}
+        )
         return {"statusCode": 200, "body": "stale"}
 
     if _msg_already_processed(wamid):
-        logging.info("[WEBHOOK] Mensaje ya procesado %s", wamid)
+        logging.info(
+            "[WEBHOOK] Mensaje ya procesado %s",
+            wamid,
+            extra={"correlation_id": correlation_id, "wa_id": wa_id}
+        )
         return {"statusCode": 200, "body": "ok"}
 
     # 2.2) UX: marcar leído + typing (opcional delay leve)
@@ -275,7 +297,11 @@ def lambda_handler(event, context):
     # 2.3) Gestión de botones
     if msg_type in ("button", "interactive", "list"):
         payload_lower, context_id = _extract_button_payload(msg_type, msg_obj)
-        logging.info("🔘 Button payload = %r (ctx=%s)", payload_lower, context_id)
+        logging.info(
+            "🔘 Button payload = %r (ctx=%s)",
+            payload_lower, context_id,
+            extra={"correlation_id": correlation_id, "wa_id": wa_id, "wamid": wamid}
+        )
         _handle_button_action(payload_lower, wa_id, context_id)
         return {"statusCode": 200, "body": "ok"}
 
@@ -290,12 +316,34 @@ def lambda_handler(event, context):
                 return {"statusCode": 200, "body": "ok"}
             user_msg = text
         except Exception:
-            logging.exception("[audio] fallo transcripción; se sigue con cadena vacía")
+            logging.exception(
+                "[audio] fallo transcripción; se sigue con cadena vacía",
+                extra={"correlation_id": correlation_id, "wa_id": wa_id, "wamid": wamid}
+            )
             user_msg = ""
     else:
         user_msg = msg_obj.get("text", {}).get("body", "").strip()
 
-    # 2.5) Orchestrator → respuesta
+    # 2.5) Asegurar thread activo (idempotente/seguro ante carreras)
+    try:
+        _ = ensure_thread(
+            wa_phone_raw=wa_id,
+            customer_id=None,  # si lo tenés resuelto antes, pasalo aquí
+            correlation_id=correlation_id,
+            last_wa_msg_id=wamid
+        )
+        logging.info(
+            "[WEBHOOK] ensure_thread OK",
+            extra={"correlation_id": correlation_id, "wa_id": wa_id, "wamid": wamid}
+        )
+    except Exception:
+        # Hardening: no tiramos 5xx al webhook; log y seguimos (el orchestrator también reintenta)
+        logging.exception(
+            "[WEBHOOK] ensure_thread falló (se continúa para no interrumpir el flujo)",
+            extra={"correlation_id": correlation_id, "wa_id": wa_id, "wamid": wamid}
+        )
+
+    # 2.6) Orchestrator → respuesta
     bot_reply = orchestrator.handle_message(user_msg or "", wa_id, name, wamid)
 
     # 2.6) Construcción de payload de salida
