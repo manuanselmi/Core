@@ -27,7 +27,7 @@ import datetime as dt
 from app.models import db, Reminder, Customer, ScheduledMessage
 from app.services.google_calendar_service import CALENDAR_ID, GoogleCalendarService
 from app.services.send_message_flow import SendMessageFlow
-from app.services.openai_service import client, _thread_for, ASSISTANT_ID
+from app.services.openai_service import client, get_or_create_thread, ASSISTANT_ID
 from zoneinfo import ZoneInfo
 import os
 
@@ -162,7 +162,7 @@ class Orchestrator:
         Envía el mensaje al Assistant y devuelve la respuesta
         (o dict si una tool-call ya maneja la salida final).-
         """
-        thread_id = _thread_for(
+        thread_id = get_or_create_thread(
             wa_id,
             customer_id=getattr(self, "current_customer_id", None),
             correlation_id=getattr(current_app, "correlation_id", None),

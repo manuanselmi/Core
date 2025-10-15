@@ -14,10 +14,9 @@ from flask import Flask
 from sqlalchemy.pool import NullPool
 
 from app.models import db, Turn, Reminder, ScheduledMessage, Customer
-from app.services.threads_service import ensure_thread
 from app.utils.phone_utils import normalize_phone_e164
 from uuid import uuid4
-from app.services.openai_service import client as openai_client 
+from app.services.openai_service import client as openai_client , get_or_create_thread
 from app.services.orchestrator import Orchestrator
 from app.services import scheduler_service
 from app.utils.whatsapp_utils import (
@@ -324,24 +323,25 @@ def lambda_handler(event, context):
     else:
         user_msg = msg_obj.get("text", {}).get("body", "").strip()
 
-    # 2.5) Asegurar thread activo (idempotente/seguro ante carreras)
+    # 2.5) Asegurar/obtener thread activo (idempotente y sin carrera)
     try:
-        _ = ensure_thread(
-            wa_phone_raw=wa_id,
-            customer_id=None,  # si lo tenés resuelto antes, pasalo aquí
+        thread_id = get_or_create_thread(
+            wa_id=wa_id,
+            customer_id=None,  # si lo resolvés antes, pasalo aquí
             correlation_id=correlation_id,
-            last_wa_msg_id=wamid
+            last_wa_msg_id=wamid,
         )
         logging.info(
-            "[WEBHOOK] ensure_thread OK",
-            extra={"correlation_id": correlation_id, "wa_id": wa_id, "wamid": wamid}
+            "[WEBHOOK] get_or_create_thread OK",
+            extra={"correlation_id": correlation_id, "wa_id": wa_id, "wamid": wamid, "thread_id": thread_id},
         )
     except Exception:
         # Hardening: no tiramos 5xx al webhook; log y seguimos (el orchestrator también reintenta)
         logging.exception(
-            "[WEBHOOK] ensure_thread falló (se continúa para no interrumpir el flujo)",
-            extra={"correlation_id": correlation_id, "wa_id": wa_id, "wamid": wamid}
+            "[WEBHOOK] get_or_create_thread falló (se continúa para no interrumpir el flujo)",
+            extra={"correlation_id": correlation_id, "wa_id": wa_id, "wamid": wamid},
         )
+        thread_id = None  # opcional: si no querés romper flujos posteriores
 
     # 2.6) Orchestrator → respuesta
     bot_reply = orchestrator.handle_message(user_msg or "", wa_id, name, wamid)

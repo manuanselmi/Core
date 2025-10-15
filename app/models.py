@@ -77,7 +77,6 @@ class ScheduledMessage(db.Model):
     def mark_error(self):
         self.status = "error"
         db.session.commit()
-# ------------------------------------------------------------
 
 
 class AssistantThread(db.Model):
@@ -85,12 +84,12 @@ class AssistantThread(db.Model):
 
     id             = db.Column(db.Integer, primary_key=True, autoincrement=True)
     customer_id    = db.Column(db.Integer, db.ForeignKey("customers.id"), nullable=True, index=True)
-    wa_phone       = db.Column(db.String(32), nullable=False, index=True)  # E.164
+    wa_phone       = db.Column(db.String(32), nullable=False, index=True)  
     thread_id      = db.Column(db.String(128), nullable=False, unique=True)
-    status         = db.Column(db.String(16), nullable=False, default="active")  # active|archived
-    metadata       = db.Column(JSONB, nullable=True)
+    status         = db.Column(db.String(16), nullable=False, default="active")  
+    meta           = db.Column("metadata", JSONB, nullable=True)
     last_wa_msg_id = db.Column(db.String(200), nullable=True)
-    dedupe_key     = db.Column(db.String(200), nullable=True)  # UNIQUE parcial
+    dedupe_key     = db.Column(db.String(200), nullable=True)  
     created_at     = db.Column(db.DateTime(timezone=True), server_default=db.func.now(), nullable=False)
     updated_at     = db.Column(db.DateTime(timezone=True), server_default=db.func.now(), onupdate=db.func.now(), nullable=False)
     last_used_at   = db.Column(db.DateTime(timezone=True), server_default=db.func.now(), nullable=False)
@@ -98,5 +97,4 @@ class AssistantThread(db.Model):
     __table_args__ = (
         db.Index("ix_assistant_threads_customer_id", "customer_id"),
         db.Index("ix_assistant_threads_wa_phone", "wa_phone"),
-        # Nota: el UNIQUE(wa_phone) parcial por status='active' se crea en la migración SQL.
     )
