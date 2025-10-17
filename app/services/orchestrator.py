@@ -73,14 +73,6 @@ class Orchestrator:
 
         # Assistants (igual)
         reply = self._assistant_reply(user.get("phone"), message or "", name)
-        
-        # Persistir turno en memoria (legacy)
-        Memory.save_turn(phone, "user", message, wa_msg_id=wa_msg_id)
-        if isinstance(reply, str):
-            Memory.save_turn(phone, "assistant", reply)
-            if Memory.should_summarize(phone):
-                Memory.summarize(phone, self.client)
-
         return reply
 
     # ---------------- Dispatcher para tools ---------------------
