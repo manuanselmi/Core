@@ -5,12 +5,11 @@ import re
 import logging
 from datetime import datetime, timedelta, timezone
 from typing import List, Dict
-
-
 import app
 from google.oauth2 import service_account
 from googleapiclient.discovery import build
 from flask import current_app
+import json
  
 def _logger():
     """Devuelve el logger de Flask si hay contexto; si no, un logger estándar."""
@@ -57,17 +56,13 @@ class GoogleCalendarService:
 
     def __init__(self):
         service_file = os.getenv("GOOGLE_SERVICE_ACCOUNT_FILE")
-        if not service_file:
-            # Feature gate: Google opcional
-            logging.warning("Google Calendar desactivado: falta GOOGLE_SERVICE_ACCOUNT_FILE.")
-            self.client = None
-            return
+        sa_json = os.getenv("GOOGLE_SA_JSON")
         try:
-            self._init_client(service_file)
+            self._init_client(service_file, sa_json)
         except Exception as e:
             logging.error(f"Error inicializando GoogleCalendarService: {e}")
             _logger().error(f"Error inicializando GoogleCalendarService: {e}")
-            self.client = None
+            self.service = None
             
     # ---------- Disponibilidad ----------
     def get_free_slots(
@@ -164,3 +159,24 @@ class GoogleCalendarService:
 
         return event["id"]
     
+def _init_client(self, service_file: str | None, sa_json: str | None):
+        SCOPES = ["https://www.googleapis.com/auth/calendar"]
+        creds = None
+        if service_file and os.path.exists(service_file):
+            creds = service_account.Credentials.from_service_account_file(
+                service_file, scopes=SCOPES
+            )
+        elif sa_json:
+            info = json.loads(sa_json)
+            creds = service_account.Credentials.from_service_account_info(
+                info, scopes=SCOPES
+            )
+        else:
+            # Feature gate: Google opcional si no hay credenciales
+            raise RuntimeError("Falta GOOGLE_SERVICE_ACCOUNT_FILE o GOOGLE_SA_JSON")
+
+        delegated = os.getenv("GOOGLE_DELEGATED_USER")
+        if delegated:
+            creds = creds.with_subject(delegated)
+
+        self.service = build("calendar", "v3", credentials=creds, cache_discovery=False)
