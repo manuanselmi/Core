@@ -54,6 +54,28 @@ def _resolve_calendar_id(wa_id: str | None, explicit_calendar_id: str | None = N
 class GoogleCalendarService:
     """Wrapper mínimo para *free/busy* y creación de os con ruteo por WAID."""
 
+    def _init_client(self, service_file: str | None, sa_json: str | None):
+        SCOPES = ["https://www.googleapis.com/auth/calendar"]
+        creds = None
+        if service_file and os.path.exists(service_file):
+            creds = service_account.Credentials.from_service_account_file(
+                service_file, scopes=SCOPES
+            )
+        elif sa_json:
+            info = json.loads(sa_json)
+            creds = service_account.Credentials.from_service_account_info(
+                info, scopes=SCOPES
+            )
+        else:
+            # Feature gate: Google opcional si no hay credenciales
+            raise RuntimeError("Falta GOOGLE_SERVICE_ACCOUNT_FILE o GOOGLE_SA_JSON")
+
+        delegated = os.getenv("GOOGLE_DELEGATED_USER")
+        if delegated:
+            creds = creds.with_subject(delegated)
+
+        self.service = build("calendar", "v3", credentials=creds, cache_discovery=False)
+        
     def __init__(self):
         service_file = os.getenv("GOOGLE_SERVICE_ACCOUNT_FILE")
         sa_json = os.getenv("GOOGLE_SA_JSON")
@@ -158,25 +180,3 @@ class GoogleCalendarService:
                 logging.exception("[GoogleCalendarService] No se pudo enviar WhatsApp a Lucas")
 
         return event["id"]
-    
-def _init_client(self, service_file: str | None, sa_json: str | None):
-        SCOPES = ["https://www.googleapis.com/auth/calendar"]
-        creds = None
-        if service_file and os.path.exists(service_file):
-            creds = service_account.Credentials.from_service_account_file(
-                service_file, scopes=SCOPES
-            )
-        elif sa_json:
-            info = json.loads(sa_json)
-            creds = service_account.Credentials.from_service_account_info(
-                info, scopes=SCOPES
-            )
-        else:
-            # Feature gate: Google opcional si no hay credenciales
-            raise RuntimeError("Falta GOOGLE_SERVICE_ACCOUNT_FILE o GOOGLE_SA_JSON")
-
-        delegated = os.getenv("GOOGLE_DELEGATED_USER")
-        if delegated:
-            creds = creds.with_subject(delegated)
-
-        self.service = build("calendar", "v3", credentials=creds, cache_discovery=False)

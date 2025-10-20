@@ -3,29 +3,6 @@
     {
       "type": "function",
       "function": {
-        "name": "get_weather",
-        "description": "Obtiene el clima actual para una ubicación.",
-        "strict": true,
-        "parameters": {
-          "type": "object",
-          "properties": {
-            "location": {
-              "type": "string",
-              "description": "Ciudad o país del que se desea saber el clima"
-            },
-            "date": {
-              "type": "string",
-              "description": "YYYY-MM-DD"
-            }
-          },
-          "required": ["location", "date"],
-          "additionalProperties": false
-        }
-      }
-    },
-    {
-      "type": "function",
-      "function": {
         "name": "create_reminder",
         "description": "Crea un reminder en el calendario interno y agenda recordatorio por WhatsApp.",
         "strict": true,
@@ -102,7 +79,8 @@
           "properties": {
             "date":        { "type": "string",  "description": "YYYY-MM-DD" },
             "start_time":  { "type": "string",  "description": "HH:MM (opcional)" },
-            "end_time":    { "type": "string",  "description": "HH:MM (opcional)" }
+            "end_time":    { "type": "string",  "description": "HH:MM (opcional)" },
+            "slot_minutes":{ "type": "integer", "description": "Duración de cada bloque en minutos", "minimum": 15, "default": 60 }
           },
           "required": ["date"],
           "additionalProperties": false
@@ -139,25 +117,6 @@
             "fecha_hora": { "type": "string", "description": "ISO-8601 en America/Montevideo; si se omite/es null, se envía ahora." }
           },
           "required": ["telefono", "mensaje"],
-          "additionalProperties": false
-        }
-      }
-    },
-    {
-      "type": "function",
-      "function": {
-        "name": "summarize_pdf",
-        "description": "Descarga y resume un documento PDF en texto conciso.",
-        "strict": true,
-        "parameters": {
-          "type": "object",
-          "properties": {
-            "pdf_url": {
-              "type": "string",
-              "description": "URL donde se puede descargar el PDF."
-            }
-          },
-          "required": ["pdf_url"],
           "additionalProperties": false
         }
       }

@@ -47,10 +47,13 @@ class Orchestrator:
         self.current_customer_id = None
         self.current_phone = None
         self.current_name = None
-        self.calendar_api = None
-        self.has_calendar = False
+        self.calendar_api = GoogleCalendarService()
+        # Considerá ambos atributos; la lib usa 'service'
+        self.has_calendar = bool(
+            getattr(self.calendar_api, "service", None)
+            or getattr(self.calendar_api, "client", None)
+        )
         try:
-            from app.services.google_calendar_service import GoogleCalendarService
             self.calendar_api = GoogleCalendarService() 
             self.has_calendar = bool(getattr(self.calendar_api, "client", None))
         except Exception as e:
@@ -411,6 +414,38 @@ class Orchestrator:
         except Exception as exc:
             logging.exception("[schedule_meeting] error")
             return {"error": str(exc)}
+        
+    def check_availability(
+        self,
+        date: str,
+        start_time: str | None = None,
+        end_time: str | None = None,
+        slot_minutes: int = 60,
+        calendar_id: str | None = None,
+    ):
+        """
+        Tool: devuelve bloques libres (del tamaño 'slot_minutes') en la fecha indicada.
+        Usa el WAID del usuario actual para resolver calendario especial si aplica.
+        """
+        if not self.has_calendar or not getattr(self.calendar_api, "get_free_slots", None):
+            return {
+                "error": "calendar_unavailable",
+                "message": "No tengo acceso a Google Calendar por ahora.",
+            }
+        try:
+            wa_id = self.current_phone  # WhatsApp del usuario actual, si lo tenés en contexto
+            slots = self.calendar_api.get_free_slots(
+                date_str=date,
+                start_time=start_time,
+                end_time=end_time,
+                slot_minutes=slot_minutes,
+                wa_id=wa_id,
+                calendar_id=calendar_id,
+            )
+            return {"slots": slots}
+        except Exception as e:
+            logging.exception("[check_availability] error")
+            return {"error": "calendar_error", "message": str(e)}
 
     # ------------------------------------------------------------------
     # 📅  Programar mensajes a terceros (sin APScheduler)
