@@ -264,7 +264,6 @@ class Orchestrator:
             # Si el run anterior falló o fue cancelado, crear uno nuevo
             run_args = { "thread_id": thread_id, "assistant_id": ASSISTANT_ID }
         else:
-            # Create a new run if no active run exists
             # Siempre incluir extra_instructions con fecha/hora actual
             try:
                 run = client.beta.threads.runs.create(
@@ -302,55 +301,49 @@ class Orchestrator:
                     name = call.function.name
                     args = json.loads(call.function.arguments or "{}")
 
-                    # saneo de fechas de create_reminder (mantengo tu lógica de normalización)
-                    if name == "create_reminder":
-                        # 1) Preferencia a argumentos bien formateados del assistant
-                        dt_assistant = None
+                    if name == "schedule_meeting":
                         local_tz = ZoneInfo(LOCAL_TZ_STR)
-                        now_local = datetime.now(local_tz)
-                        try:
-                            candidate = args.get("date")
-                            if candidate:
-                                dt_assistant = dateparser.parse(
-                                    candidate,
-                                    settings={
-                                        "TIMEZONE": LOCAL_TZ_STR,
-                                        "RETURN_AS_TIMEZONE_AWARE": True,
-                                        "PREFER_DATES_FROM": "future",
-                                        "STRICT_PARSING": False,
-                                    },
-                                )
-                                if dt_assistant and dt_assistant.tzinfo is None:
-                                    dt_assistant = dt_assistant.replace(tzinfo=local_tz)
-                                else:
-                                    dt_assistant = dt_assistant.astimezone(local_tz)
-                        except Exception:
-                                dt_assistant = None
-
-                        if dt_assistant and dt_assistant > now_local:
-                            dt_final = dt_assistant
-                        else:
-                            # 2) Fallback: reparsear desde el texto (si el Assistant no trajo fecha válida o quedó pasada)
-                            dt_from_text = normalize_to_future(user_msg, tz_str=LOCAL_TZ_STR, strict=True)
-                            if dt_from_text:
-                                if dt_from_text.tzinfo is None:
-                                    dt_from_text = dt_from_text.replace(tzinfo=local_tz)
-                                if dt_from_text > now_local:
-                                    dt_final = dt_from_text
-
-                        # 3) Si seguimos sin fecha válida, devolvemos error para que el assistant pida precisión
+                        dt_final = None
+                        raw = (args or {}).get("date")
+                        if isinstance(raw, str) and raw.strip():
+                            try:
+                                # Acepta "YYYY-MM-DDTHH:MM" o "YYYY-MM-DD HH:MM"
+                                dt_final = datetime.fromisoformat(raw.replace(" ", "T"))
+                            except Exception:
+                                try:
+                                    import dateparser
+                                    dt_final = dateparser.parse(
+                                        raw,
+                                        settings={
+                                            "TIMEZONE": LOCAL_TZ_STR,
+                                            "RETURN_AS_TIMEZONE_AWARE": True,
+                                            "PREFER_DATES_FROM": "future",
+                                            "STRICT_PARSING": False,
+                                        },
+                                    )
+                                except Exception:
+                                    dt_final = None
+                        # Fallback: inferir desde el texto del usuario si vino mal
                         if dt_final is None:
+                            dt_final = normalize_to_future(user_msg, tz_str=LOCAL_TZ_STR, strict=True)
+
+                        if not dt_final:
                             tool_outputs.append({
                                 "tool_call_id": call.id,
                                 "output": json.dumps({
                                     "ok": False,
                                     "error": "TIME_NOT_UNDERSTOOD",
-                                    "hint": "No pude inferir una fecha/hora válida (quedó vacía o en el pasado). Pedí hora exacta."
+                                    "hint": "No pude entender la fecha/hora. Indicá día y hora exactos.",
                                 }, ensure_ascii=False)
                             })
                             continue
-                        # 4) Formateo final (local)
-                        args["date"] = dt_final.strftime("%Y-%m-%d %H:%M")
+
+                        if dt_final.tzinfo is None:
+                            dt_final = dt_final.replace(tzinfo=local_tz)
+                        else:
+                            dt_final = dt_final.astimezone(local_tz)
+                        # ISO local para GoogleCalendarService
+                        args["date"] = dt_final.strftime("%Y-%m-%dT%H:%M")
 
                     try:
                         result = self._execute_function(name, **args)
