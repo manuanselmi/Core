@@ -102,8 +102,8 @@ class GoogleCalendarService:
         calendar_id: str | None = None,
     ) -> List[Dict]:
         """Devuelve bloques libres de `slot_minutes` min en la fecha dada."""
-        _logger().info("[GoogleCalendarService] Buscando slots libres: date=%s, start=%s, end=%s, slot_min=%d, wa_id=%s",
-                      date_str, start_time, end_time, slot_minutes, wa_id)
+        current_app.logger.info("[APPOINTMENT] Searching free slots: date=%s, start=%s, end=%s, duration=%d minutes, user=%s",
+                  date_str, start_time, end_time, slot_minutes, wa_id)
         
         # 1️⃣  Normalizamos la ventana de búsqueda
         try:
@@ -112,24 +112,29 @@ class GoogleCalendarService:
             # Aseguramos que la fecha no sea en el pasado
             now = datetime.now(LOCAL_TZ)
             if day.date() < now.date():
-                _logger().warning("[GoogleCalendarService] Fecha en el pasado, ajustando a hoy: %s -> %s", 
+                current_app.logger.warning("[APPOINTMENT] Date in past, adjusting to today: %s -> %s", 
                                 day.date(), now.date())
-                day = now
-            
-            # Normalizamos horarios de inicio y fin
+                day = now            # Normalizamos horarios de inicio y fin
             base_date = day.date()
             if end_time and datetime.strptime(end_time, "%H:%M").time() < datetime.strptime(start_time or "08:00", "%H:%M").time():
                 # Si el fin es antes que el inicio, asumimos que es para el día siguiente
                 base_date = base_date + timedelta(days=1)
-            
+            # Normalizamos horarios de inicio y fin
             t_min = (
                 datetime.combine(day.date(), datetime.strptime(start_time, "%H:%M").time(), tzinfo=LOCAL_TZ)
                 if start_time else day.replace(hour=8, minute=0)
             )
-            t_max = (
-                datetime.combine(base_date, datetime.strptime(end_time, "%H:%M").time(), tzinfo=LOCAL_TZ)
-                if end_time else day.replace(hour=20, minute=0)
-            )
+            
+            # Si end_time es igual a start_time, ajustamos para que sea slot_minutes después
+            if end_time and end_time == start_time:
+                t_max = t_min + timedelta(minutes=slot_minutes)
+                _logger().info("[GoogleCalendarService] Ajustando t_max para crear ventana válida: %s -> %s",
+                            end_time, t_max.strftime("%H:%M"))
+            else:
+                t_max = (
+                    datetime.combine(day.date(), datetime.strptime(end_time, "%H:%M").time(), tzinfo=LOCAL_TZ)
+                    if end_time else day.replace(hour=20, minute=0)
+                )
             
             # Validamos que t_min sea menor que t_max
             if t_min >= t_max:
@@ -173,15 +178,16 @@ class GoogleCalendarService:
                 }
             ).execute()
             busy = fb["calendars"][cal_id]["busy"]
-            _logger().info("[GoogleCalendarService] Slots ocupados encontrados: %d", len(busy))
-            _logger().debug("[GoogleCalendarService] Detalle slots ocupados: %s", busy)
+            current_app.logger.info("[APPOINTMENT] Found %d busy slots", len(busy))
+            current_app.logger.debug("[APPOINTMENT] Busy slots detail: %s", busy)
         except Exception as e:
-            _logger().error("[GoogleCalendarService] Error consultando freebusy: %s", str(e))
+            current_app.logger.error("[APPOINTMENT] Error checking freebusy: %s", str(e))
             return []
 
         # 4️⃣  Construimos la lista de huecos libres
         pointer = t_min
         free: List[Dict] = []
+        current_app.logger.debug("[APPOINTMENT] Analyzing time slots between busy periods")
         for b in busy:
             start_b = datetime.fromisoformat(b["start"]).astimezone(LOCAL_TZ)
             if pointer + timedelta(minutes=slot_minutes) <= start_b:
@@ -190,7 +196,8 @@ class GoogleCalendarService:
                     "end": (pointer + timedelta(minutes=slot_minutes)).isoformat(timespec="minutes"),
                 })
             pointer = max(pointer, datetime.fromisoformat(b["end"]).astimezone(LOCAL_TZ))
-        # Después del último ocupado
+        # Add remaining slots after last busy period
+        current_app.logger.debug("[APPOINTMENT] Adding slots after last busy period")
         while pointer + timedelta(minutes=slot_minutes) <= t_max:
             free.append({
                 "start": pointer.isoformat(timespec="minutes"),
@@ -210,16 +217,16 @@ class GoogleCalendarService:
         calendar_id: str | None = None,
     ) -> str:
         """Crea un evento y notifica por WhatsApp a Lucas. Devuelve el `eventId`."""
-        _logger().info("[GoogleCalendarService] Intentando agendar reunión: start=%s, title=%s, duration=%d, wa_id=%s",
+        current_app.logger.info("[APPOINTMENT] Scheduling meeting: start=%s, title=%s, duration=%d minutes, user=%s",
                       start_dt_str, title, duration_minutes, wa_id)
         
         if not self.service:
-            _logger().error("[GoogleCalendarService] No hay servicio de calendario inicializado")
-            raise RuntimeError("Servicio de calendario no inicializado")
+            current_app.logger.error("[APPOINTMENT] Calendar service not initialized")
+            raise RuntimeError("Calendar service not initialized")
             
         start_dt = datetime.fromisoformat(start_dt_str).replace(tzinfo=LOCAL_TZ)
         end_dt = start_dt + timedelta(minutes=duration_minutes)
-        _logger().debug("[GoogleCalendarService] Horario normalizado: start=%s, end=%s",
+        current_app.logger.debug("[APPOINTMENT] Normalized time: start=%s, end=%s",
                       start_dt.isoformat(), end_dt.isoformat())
 
         body = {
@@ -228,16 +235,16 @@ class GoogleCalendarService:
             "start": {"dateTime": start_dt.isoformat(), "timeZone": str(LOCAL_TZ)},
             "end":   {"dateTime": end_dt.isoformat(), "timeZone": str(LOCAL_TZ)},
         }
-        _logger().debug("[GoogleCalendarService] Payload del evento: %s", json.dumps(body))
+        current_app.logger.debug("[APPOINTMENT] Event payload: %s", json.dumps(body))
 
-        # Selección de calendario (explícito > especial por WAID > default) — consistente con freebusy
+        # Select calendar (explicit > special by WAID > default) - consistent with freebusy
         cal_id = _resolve_calendar_id(wa_id, calendar_id)
         try:
             event = self.service.events().insert(calendarId=cal_id, body=body).execute()
-            _logger().info("[GoogleCalendarService] Evento creado exitosamente: id=%s, wa_id=%s -> calendar_id=%s",
+            current_app.logger.info("[APPOINTMENT] Event created successfully: id=%s, user=%s, calendar=%s",
                           event.get("id"), _norm_waid(wa_id), cal_id)
         except Exception as e:
-            _logger().error("[GoogleCalendarService] Error creando evento: %s", str(e))
+            current_app.logger.error("[APPOINTMENT] Error creating event: %s", str(e))
             raise
 
         # WhatsApp a Lucas (si está configurado)
@@ -246,9 +253,8 @@ class GoogleCalendarService:
             text = f"📅 Nueva reunión: “{title}” — {start_dt.strftime('%d/%m/%Y %H:%M')} - si queres contactarte con la persona, aquí está su número: {wa_id}"
             try:
                 send_message(get_text_message_input(LUCAS_WAID, text))
-                current_app.logger.info("[GoogleCalendarService] WhatsApp enviado a Lucas: %s", text)
-                logging.info("[GoogleCalendarService] WhatsApp enviado a Lucas")
+                current_app.logger.info("[APPOINTMENT] WhatsApp notification sent to admin: %s", text)
             except Exception:
-                logging.exception("[GoogleCalendarService] No se pudo enviar WhatsApp a Lucas")
+                current_app.logger.exception("[APPOINTMENT] Failed to send WhatsApp notification to admin")
 
         return event["id"]

@@ -33,6 +33,34 @@ import os
 
 LOCAL_TZ_STR = os.getenv("TZ", "America/Montevideo")
 
+_WD_MAP = {
+    "Monday": "lunes",
+    "Tuesday": "martes",
+    "Wednesday": "miércoles",
+    "Thursday": "jueves",
+    "Friday": "viernes",
+    "Saturday": "sábado",
+    "Sunday": "domingo"
+}
+
+def build_extra_instructions(user_name: str | None) -> str:
+    """
+    Construye instrucciones adicionales para el Assistant con fecha/hora actual.
+    Mantiene formato y contenido exacto del legacy para compatibilidad.
+    """
+    local_tz = ZoneInfo(LOCAL_TZ_STR)
+    now = datetime.now(local_tz)
+    weekday_es = _WD_MAP[now.strftime('%A')]
+    
+    return (
+        f"Usá la tool correcta según corresponda, una sola por turno. "
+        f"Perfil del usuario: se llama '{user_name}'. "
+        f"Si el usuario pregunta '¿cómo me llamo?' o similar, respondé '{user_name}'. "
+        f"Podés saludar o referirte a él por ese nombre cuando tenga sentido. "
+        f"La fecha y hora actual es {now.strftime('%d/%m/%Y %H:%M')} "
+        f"y el día de hoy es {weekday_es}."
+    )
+
 def log_http_response(response):
     logging.info(f"Status: {response.status_code}")
     logging.info(f"Content-type: {response.headers.get('content-type')}")
@@ -179,11 +207,8 @@ class Orchestrator:
             last_wa_msg_id=os.getenv("CURRENT_WAMID")  # opcional si lo guardás en contexto
         )
         
-        extra_instr = None
-        try:
-            extra_instr = Memory.build_ephemeral_instructions(wa_id=wa_id, user_name=user_name)
-        except Exception:
-            current_app.logger.warning("[Memory] no se pudieron construir instrucciones efímeras")
+        # Siempre construir extra_instructions con fecha/hora actual
+        extra_instr = build_extra_instructions(user_name)
 
         # 1) Guardar el turno del usuario
         max_retries = 3
@@ -240,11 +265,29 @@ class Orchestrator:
             run_args = { "thread_id": thread_id, "assistant_id": ASSISTANT_ID }
         else:
             # Create a new run if no active run exists
-            run_args = { "thread_id": thread_id, "assistant_id": ASSISTANT_ID }
-
-            if extra_instr:
-                run_args["instructions"] = extra_instr
-            run = client.beta.threads.runs.create(**run_args)
+            # Siempre incluir extra_instructions con fecha/hora actual
+            try:
+                run = client.beta.threads.runs.create(
+                    thread_id=thread_id,
+                    assistant_id=ASSISTANT_ID,
+                    additional_instructions=extra_instr
+                )
+            except Exception as e:
+                # Fallback: si additional_instructions no está soportado,
+                # agregamos el contexto al mensaje del usuario
+                if "additional_instructions" in str(e):
+                    current_app.logger.warning("[Orchestrator] Fallback: adding context to user message")
+                    client.beta.threads.messages.create(
+                        thread_id=thread_id,
+                        role="user",
+                        content=f"{user_msg}\n\n[Contexto actual]: {extra_instr}"
+                    )
+                    run = client.beta.threads.runs.create(
+                        thread_id=thread_id,
+                        assistant_id=ASSISTANT_ID
+                    )
+                else:
+                    raise
             current_app.logger.info("[Orchestrator] Run started: %s", run.id)
 
         # 3) Loop de polling con manejo de tools
@@ -435,18 +478,23 @@ class Orchestrator:
         """
         Reserva slot en el Calendar si está libre.
         """
-        self.logger.info("Intentando agendar reunión: date=%s, duration=%d, title=%s, user=%s",
+        current_app.logger.info("[APPOINTMENT] Attempting to schedule: date=%s, duration=%d, title=%s, user=%s",
                     date, duration_minutes, title, self.current_phone)
         
         if not self.has_calendar:
-            self.logger.error("No hay servicio de calendario inicializado")
+            current_app.logger.error("[APPOINTMENT] Calendar service not initialized")
             raise RuntimeError("Servicio de calendario no disponible")
         try:
             # 0) Customer actual
             wa_id_var = getattr(self, "current_phone", None)
 
             # 1) Check básico de disponibilidad
-            slots = self.calendar_api.list_available_slots(date, duration_minutes, calendar_id)
+            slots = self.calendar_api.get_free_slots(
+                date_str=date,
+                slot_minutes=duration_minutes,
+                calendar_id=calendar_id,
+                wa_id=wa_id_var
+            )
             if not slots:
                 return {
                     "error": "slot_unavailable",
@@ -480,11 +528,11 @@ class Orchestrator:
         Tool: devuelve bloques libres (del tamaño 'slot_minutes') en la fecha indicada.
         Usa el WAID del usuario actual para resolver calendario especial si aplica.
         """
-        self.logger.info("Consultando disponibilidad: date=%s, start=%s, end=%s, slot_min=%d, user=%s",
+        current_app.logger.info("[APPOINTMENT] Checking availability: date=%s, start=%s, end=%s, duration=%d minutes, user=%s",
                         date, start_time, end_time, slot_minutes, self.current_phone)
         
         if not self.has_calendar or not getattr(self.calendar_api, "get_free_slots", None):
-            self.logger.error("Servicio de calendario no disponible o método get_free_slots no encontrado")
+            current_app.logger.error("[APPOINTMENT] Calendar service unavailable")
             return {"error": "calendar_unavailable"}
         if not self.has_calendar or not getattr(self.calendar_api, "get_free_slots", None):
             return {
