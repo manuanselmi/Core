@@ -47,22 +47,29 @@ class Orchestrator:
         self.current_customer_id = None
         self.current_phone = None
         self.current_name = None
-        self.calendar_api = GoogleCalendarService()
-        # Considerá ambos atributos; la lib usa 'service'
-        self.has_calendar = bool(
-            getattr(self.calendar_api, "service", None)
-            or getattr(self.calendar_api, "client", None)
-        )
+        self.logger = logging.getLogger("Orchestrator")
+        if not self.logger.handlers:
+            handler = logging.StreamHandler()
+            handler.setLevel(logging.DEBUG)
+            formatter = logging.Formatter('%(asctime)s - %(name)s - %(levelname)s - %(message)s')
+            handler.setFormatter(formatter)
+            self.logger.addHandler(handler)
+            self.logger.setLevel(logging.DEBUG)
         try:
-            self.calendar_api = GoogleCalendarService() 
-            self.has_calendar = bool(getattr(self.calendar_api, "client", None))
+            self.calendar_api = GoogleCalendarService()
+            self.has_calendar = bool(
+                getattr(self.calendar_api, "service", None)  # nuestro wrapper
+                or getattr(self.calendar_api, "client", None)  # por si en el futuro cambiamos el nombre
+            )
         except Exception as e:
             logging.warning("Calendar deshabilitado o no disponible: %s", e)
             self.calendar_api = None
             self.has_calendar = False
 
-        if not self.has_calendar:
-            logging.info("Google Calendar API no inicializada (modo sin Google).")
+        logging.info(
+            "Google Calendar API %s",
+            "inicializada" if self.has_calendar else "no inicializada (modo sin Google)."
+        )
         self.send_msg_flow = SendMessageFlow()
 
     def handle_message(self, message: str, phone: str, name: str | None, wa_msg_id: str | None):
@@ -179,18 +186,58 @@ class Orchestrator:
             current_app.logger.warning("[Memory] no se pudieron construir instrucciones efímeras")
 
         # 1) Guardar el turno del usuario
-        client.beta.threads.messages.create(
-            thread_id=thread_id,
-            role="user",
-            content=user_msg
-        )
+        max_retries = 3
+        retry_count = 0
+        while retry_count < max_retries:
+            try:
+                client.beta.threads.messages.create(
+                    thread_id=thread_id,
+                    role="user",
+                    content=user_msg
+                )
+                break
+            except Exception as e:
+                retry_count += 1
+                current_app.logger.warning(
+                    "[Orchestrator] Error al crear mensaje (intento %d/%d): %s",
+                    retry_count, max_retries, str(e)
+                )
+                if "while a run is active" in str(e):
+                    # Si hay un run activo, esperar un momento antes de reintentar
+                    time.sleep(2)
+                    continue
+                if retry_count >= max_retries:
+                    raise
 
         # 2) Lanzar el run con instrucciones efímeras (acá sí)
         # Check if there's an active run for the thread
         last_runs = client.beta.threads.runs.list(thread_id=thread_id, limit=1).data
         if last_runs and last_runs[0].status in ("queued", "in_progress", "requires_action"):
             current_app.logger.info("[Orchestrator] Active run detected: %s", last_runs[0].id)
+            # Esperar a que el run activo termine o falle
+            max_retries = 10
+            retry_count = 0
             run = last_runs[0]
+            
+            while retry_count < max_retries and run.status in ("queued", "in_progress", "requires_action"):
+                current_app.logger.info("[Orchestrator] Esperando que termine el run activo %s (intento %d)", 
+                                      run.id, retry_count + 1)
+                time.sleep(1)  # Esperar 1 segundo entre intentos
+                run = client.beta.threads.runs.retrieve(thread_id=thread_id, run_id=run.id)
+                retry_count += 1
+                
+            if run.status in ("queued", "in_progress", "requires_action"):
+                current_app.logger.error("[Orchestrator] El run %s no terminó después de %d intentos", 
+                                       run.id, max_retries)
+                # Cancelar el run activo
+                try:
+                    client.beta.threads.runs.cancel(thread_id=thread_id, run_id=run.id)
+                    current_app.logger.info("[Orchestrator] Run %s cancelado exitosamente", run.id)
+                except Exception as e:
+                    current_app.logger.error("[Orchestrator] Error cancelando run %s: %s", run.id, str(e))
+                
+            # Si el run anterior falló o fue cancelado, crear uno nuevo
+            run_args = { "thread_id": thread_id, "assistant_id": ASSISTANT_ID }
         else:
             # Create a new run if no active run exists
             run_args = { "thread_id": thread_id, "assistant_id": ASSISTANT_ID }
@@ -388,6 +435,12 @@ class Orchestrator:
         """
         Reserva slot en el Calendar si está libre.
         """
+        self.logger.info("Intentando agendar reunión: date=%s, duration=%d, title=%s, user=%s",
+                    date, duration_minutes, title, self.current_phone)
+        
+        if not self.has_calendar:
+            self.logger.error("No hay servicio de calendario inicializado")
+            raise RuntimeError("Servicio de calendario no disponible")
         try:
             # 0) Customer actual
             wa_id_var = getattr(self, "current_phone", None)
@@ -427,6 +480,12 @@ class Orchestrator:
         Tool: devuelve bloques libres (del tamaño 'slot_minutes') en la fecha indicada.
         Usa el WAID del usuario actual para resolver calendario especial si aplica.
         """
+        self.logger.info("Consultando disponibilidad: date=%s, start=%s, end=%s, slot_min=%d, user=%s",
+                        date, start_time, end_time, slot_minutes, self.current_phone)
+        
+        if not self.has_calendar or not getattr(self.calendar_api, "get_free_slots", None):
+            self.logger.error("Servicio de calendario no disponible o método get_free_slots no encontrado")
+            return {"error": "calendar_unavailable"}
         if not self.has_calendar or not getattr(self.calendar_api, "get_free_slots", None):
             return {
                 "error": "calendar_unavailable",

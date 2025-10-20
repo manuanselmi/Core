@@ -73,13 +73,13 @@
       "type": "function",
       "function": {
         "name": "check_availability",
-        "description": "Devuelve los bloques libres en Google Calendar para la fecha indicada.",
+        "description": "Devuelve bloques libres en Google Calendar para la fecha indicada (TZ = America/Montevideo).",
         "parameters": {
           "type": "object",
           "properties": {
             "date":        { "type": "string",  "description": "YYYY-MM-DD" },
-            "start_time":  { "type": "string",  "description": "HH:MM (opcional)" },
-            "end_time":    { "type": "string",  "description": "HH:MM (opcional)" },
+            "start_time":  { "type": "string",  "description": "HH:MM (24h). Default: 08:00" },
+            "end_time":    { "type": "string",  "description": "HH:MM (24h). Default: 20:00" },
             "slot_minutes":{ "type": "integer", "description": "Duración de cada bloque en minutos", "minimum": 15, "default": 60 }
           },
           "required": ["date"],
@@ -91,13 +91,14 @@
       "type": "function",
       "function": {
         "name": "schedule_meeting",
-        "description": "Crea un evento en Google Calendar y notifica a Lucas.",
+        "description": "Agenda una reunión en Google Calendar si el horario está libre (TZ = America/Montevideo).",
         "parameters": {
           "type": "object",
           "properties": {
-            "date":             { "type": "string",  "description": "YYYY-MM-DD HH:MM" },
-            "title":            { "type": "string",  "description": "Título de la reunión" },
-            "duration_minutes": { "type": "integer", "description": "Duración (min)", "default": 60 }
+            "date":             { "type": "string",  "description": "Inicio local ISO: YYYY-MM-DDTHH:MM (ej. 2025-10-21T08:00)" },
+            "title":            { "type": "string",  "description": "Título del evento." },
+            "duration_minutes": { "type": "integer", "description": "Duración en minutos.", "minimum": 15, "default": 60 },
+            "description":      { "type": "string",  "description": "Notas/Descripción del evento.", "default": "" }
           },
           "required": ["date", "title"],
           "additionalProperties": false

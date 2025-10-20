@@ -65,7 +65,19 @@ APP.app_context().push()
 
 scheduler_service.init_scheduler(APP)
 
-logging.getLogger().setLevel(logging.INFO)
+logging.getLogger().setLevel(logging.DEBUG)
+# Configurar loggers específicos
+for logger_name in ['GoogleCalendarService', 'Orchestrator', '__main__']:
+    logger = logging.getLogger(logger_name)
+    logger.setLevel(logging.DEBUG)
+    # Asegurar que el logger tiene un handler
+    if not logger.handlers:
+        handler = logging.StreamHandler()
+        handler.setLevel(logging.DEBUG)
+        formatter = logging.Formatter('%(asctime)s - %(name)s - %(levelname)s - %(message)s')
+        handler.setFormatter(formatter)
+        logger.addHandler(handler)
+
 logger = logging.getLogger(__name__)
 
 # Orchestrator intacto
