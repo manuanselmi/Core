@@ -7,10 +7,15 @@ from datetime import timedelta, datetime, date
 from uuid import uuid4
 from sqlalchemy.exc import IntegrityError
 from zoneinfo import ZoneInfo
-
-import dateparser 
-
 from openai import OpenAI
+import dateparser
+from app.services.responses_service import (
+    get_or_create_conversation_id,
+    responses_create,
+)
+from pathlib import Path
+from functools import lru_cache
+from app.prompts import load_kairito
 from flask import current_app 
 
 from requests import Session
@@ -27,7 +32,6 @@ import datetime as dt
 from app.models import db, Reminder, Customer, ScheduledMessage
 from app.services.google_calendar_service import CALENDAR_ID, GoogleCalendarService
 from app.services.send_message_flow import SendMessageFlow
-from app.services.openai_service import client, get_or_create_thread, ASSISTANT_ID
 from zoneinfo import ZoneInfo
 import os
 
@@ -112,6 +116,69 @@ class Orchestrator:
         # Assistants (igual)
         reply = self._assistant_reply(user.get("phone"), message or "", name)
         return reply
+    
+    # ---------- Tools catalog loader ----------
+    @staticmethod
+    @lru_cache(maxsize=1)
+    def _load_tools_catalog_cached(root_path: str) -> list[dict]:
+        """
+        Carga y normaliza functions_catalog.json una sola vez por proceso.
+        - Busca en <app root>/functions_catalog.json y en <repo root>/functions_catalog.json
+        - Limpia campos no soportados (p. ej., 'strict' dentro de 'function')
+        """
+        candidates = [
+            Path(root_path) / "functions_catalog.json",
+            Path(root_path).parent / "functions_catalog.json",
+        ]
+        raw = None
+        for p in candidates:
+            if p.exists():
+                try:
+                    raw = json.loads(p.read_text(encoding="utf-8"))
+                    break
+                except Exception:
+                    raw = None
+        # Acepta formato lista o dict con clave 'tools'
+        if isinstance(raw, dict) and "tools" in raw:
+            tools = raw.get("tools") or []
+        elif isinstance(raw, list):
+            tools = raw
+        else:
+            tools = []
+        # Normaliza: quita 'strict' dentro de cada function (en Responses es por request)
+        cleaned: list[dict] = []
+        for t in tools:
+            try:
+                if isinstance(t, dict) and t.get("type") == "function":
+                    fn = t.get("function")
+                    if isinstance(fn, dict):
+                        fn = dict(fn)
+                        fn.pop("strict", None)
+                        t = dict(t)
+                        t["function"] = fn
+                cleaned.append(t)
+            except Exception:
+                # Si algo viene mal formado, lo omitimos silenciosamente
+                continue
+        return cleaned
+
+    def _load_tools_catalog(self) -> list[dict]:
+        """
+        Devuelve la lista de tools para pasar a Responses.create(...).
+        Usa caché y hace fallback a lista vacía si no hay catálogo.
+        """
+        try:
+            root = current_app.root_path  # normalmente apunta a /var/task/app
+        except Exception:
+            root = Path(__file__).resolve().parents[2].as_posix()
+        tools = self._load_tools_catalog_cached(root)
+        if not tools:
+            try:
+                current_app.logger.warning("functions_catalog.json no encontrado o vacío; sigo sin tools.")
+            except Exception:
+                pass
+        return tools
+
 
     # ---------------- Dispatcher para tools ---------------------
     def _execute_function(self, tool_name: str, **kwargs):
@@ -197,191 +264,100 @@ class Orchestrator:
     # ---------------- Core: integrar con Assistants API ----------------
     def _assistant_reply(self, wa_id: str, user_msg: str, user_name: str | None = None) -> str | dict:
         """
-        Envía el mensaje al Assistant y devuelve la respuesta
-        (o dict si una tool-call ya maneja la salida final).-
+        Envía el mensaje a OpenAI Responses y devuelve el texto final.
+        Si hay tool-calls, las ejecuta y encadena hasta obtener respuesta final.
         """
-        thread_id = get_or_create_thread(
-            wa_id,
+        # --- Contexto base ---
+        wa_phone = wa_id  # si tenes normalizador E.164, usalo acá
+        correlation_id = getattr(current_app, "correlation_id", None)
+        wa_msg_id = os.getenv("CURRENT_WAMID")  # si lo cargas en contexto/env
+
+        # Conversación (estado persistente tipo threads)
+        conv_id = get_or_create_conversation_id(
+            wa_phone,
             customer_id=getattr(self, "current_customer_id", None),
-            correlation_id=getattr(current_app, "correlation_id", None),
-            last_wa_msg_id=os.getenv("CURRENT_WAMID")  # opcional si lo guardás en contexto
+            correlation_id=correlation_id,
+            last_wa_msg_id=wa_msg_id
         )
-        
-        # Siempre construir extra_instructions con fecha/hora actual
-        extra_instr = build_extra_instructions(user_name)
 
-        # 1) Guardar el turno del usuario
-        max_retries = 3
-        retry_count = 0
-        while retry_count < max_retries:
-            try:
-                client.beta.threads.messages.create(
-                    thread_id=thread_id,
-                    role="user",
-                    content=user_msg
-                )
-                break
-            except Exception as e:
-                retry_count += 1
-                current_app.logger.warning(
-                    "[Orchestrator] Error al crear mensaje (intento %d/%d): %s",
-                    retry_count, max_retries, str(e)
-                )
-                if "while a run is active" in str(e):
-                    # Si hay un run activo, esperar un momento antes de reintentar
-                    time.sleep(2)
-                    continue
-                if retry_count >= max_retries:
-                    raise
-
-        # 2) Lanzar el run con instrucciones efímeras (acá sí)
-        # Check if there's an active run for the thread
-        last_runs = client.beta.threads.runs.list(thread_id=thread_id, limit=1).data
-        if last_runs and last_runs[0].status in ("queued", "in_progress", "requires_action"):
-            current_app.logger.info("[Orchestrator] Active run detected: %s", last_runs[0].id)
-            # Esperar a que el run activo termine o falle
-            max_retries = 10
-            retry_count = 0
-            run = last_runs[0]
+        # Tools (de tu catálogo). Asegurate que esta función devuelva la lista (no el dict raíz)
+        tools = self._load_tools_catalog()
+        if isinstance(tools, dict) and "tools" in tools:
+            tools = tools["tools"]
             
-            while retry_count < max_retries and run.status in ("queued", "in_progress", "requires_action"):
-                current_app.logger.info("[Orchestrator] Esperando que termine el run activo %s (intento %d)", 
-                                      run.id, retry_count + 1)
-                time.sleep(1)  # Esperar 1 segundo entre intentos
-                run = client.beta.threads.runs.retrieve(thread_id=thread_id, run_id=run.id)
-                retry_count += 1
-                
-            if run.status in ("queued", "in_progress", "requires_action"):
-                current_app.logger.error("[Orchestrator] El run %s no terminó después de %d intentos", 
-                                       run.id, max_retries)
-                # Cancelar el run activo
-                try:
-                    client.beta.threads.runs.cancel(thread_id=thread_id, run_id=run.id)
-                    current_app.logger.info("[Orchestrator] Run %s cancelado exitosamente", run.id)
-                except Exception as e:
-                    current_app.logger.error("[Orchestrator] Error cancelando run %s: %s", run.id, str(e))
-                
-            # Si el run anterior falló o fue cancelado, crear uno nuevo
-            run_args = { "thread_id": thread_id, "assistant_id": ASSISTANT_ID }
-        else:
-            # Siempre incluir extra_instructions con fecha/hora actual
-            try:
-                run = client.beta.threads.runs.create(
-                    thread_id=thread_id,
-                    assistant_id=ASSISTANT_ID,
-                    additional_instructions=extra_instr
-                )
-            except Exception as e:
-                # Fallback: si additional_instructions no está soportado,
-                # agregamos el contexto al mensaje del usuario
-                if "additional_instructions" in str(e):
-                    current_app.logger.warning("[Orchestrator] Fallback: adding context to user message")
-                    client.beta.threads.messages.create(
-                        thread_id=thread_id,
-                        role="user",
-                        content=f"{user_msg}\n\n[Contexto actual]: {extra_instr}"
-                    )
-                    run = client.beta.threads.runs.create(
-                        thread_id=thread_id,
-                        assistant_id=ASSISTANT_ID
-                    )
-                else:
-                    raise
-            current_app.logger.info("[Orchestrator] Run started: %s", run.id)
+        base_instr = load_kairito()
+        now = datetime.now(ZoneInfo(current_app.config.get("TZ", "America/Montevideo")))
+        extra_instr = (
+            f"\n\n[Instrucciones de runtime]\n"
+            f"- Fecha/Hora actual: {now.strftime('%Y-%m-%d %H:%M')} ({now.tzinfo})\n"
+            f"- Usá SIEMPRE esta zona horaria para interpretar/mostrar horarios.\n"
+            f"- Stage: {current_app.config.get('STAGE','local')}\n"
+        )
+        instructions = base_instr + extra_instr
 
-        # 3) Loop de polling con manejo de tools
-        last_tool_result = None  # sólo lo usamos para create_reminder → routes manda plantilla
+        # --- 1) Primera llamada: el modelo puede pedir function_call(s) ---
+        resp = responses_create(
+            model=current_app.config["OPENAI_MODEL"],
+            instructions=instructions,
+            input_items=[{
+                "role": "user",
+                "content": [{"type": "input_text", "text": user_msg}]
+            }],
+            tools=tools,
+            conversation_id=conv_id,
+            stream=False,              # Síncrono (no SSE). La memoria persiste igual por conversation+store.
+            tool_choice="auto",
+            store=True,
+            #strict=True,
+            metadata={"wa_id": wa_phone, "wa_msg_id": wa_msg_id}
+        )
+
+        prev_id = getattr(resp, "id", None)
+
+        # --- 2) Loop: ejecutar tools y encadenar con previous_response_id ---
         while True:
-            run = client.beta.threads.runs.retrieve(thread_id=thread_id, run_id=run.id)
+            output_items = getattr(resp, "output", []) or []
+            f_calls = [it for it in output_items if getattr(it, "type", "") == "function_call"]
 
-            # a) Si requiere tools
-            if run.status == "requires_action":
-                tool_outputs = []
-                for call in run.required_action.submit_tool_outputs.tool_calls:
-                    name = call.function.name
-                    args = json.loads(call.function.arguments or "{}")
+            if not f_calls:
+                break  # no hay más tools → tenemos respuesta final
 
-                    if name == "schedule_meeting":
-                        local_tz = ZoneInfo(LOCAL_TZ_STR)
-                        dt_final = None
-                        raw = (args or {}).get("date")
-                        if isinstance(raw, str) and raw.strip():
-                            try:
-                                # Acepta "YYYY-MM-DDTHH:MM" o "YYYY-MM-DD HH:MM"
-                                dt_final = datetime.fromisoformat(raw.replace(" ", "T"))
-                            except Exception:
-                                try:
-                                    import dateparser
-                                    dt_final = dateparser.parse(
-                                        raw,
-                                        settings={
-                                            "TIMEZONE": LOCAL_TZ_STR,
-                                            "RETURN_AS_TIMEZONE_AWARE": True,
-                                            "PREFER_DATES_FROM": "future",
-                                            "STRICT_PARSING": False,
-                                        },
-                                    )
-                                except Exception:
-                                    dt_final = None
-                        # Fallback: inferir desde el texto del usuario si vino mal
-                        if dt_final is None:
-                            dt_final = normalize_to_future(user_msg, tz_str=LOCAL_TZ_STR, strict=True)
+            for fc in f_calls:
+                tool_name = fc.name
+                tool_args = json.loads(fc.arguments or "{}")
 
-                        if not dt_final:
-                            tool_outputs.append({
-                                "tool_call_id": call.id,
-                                "output": json.dumps({
-                                    "ok": False,
-                                    "error": "TIME_NOT_UNDERSTOOD",
-                                    "hint": "No pude entender la fecha/hora. Indicá día y hora exactos.",
-                                }, ensure_ascii=False)
-                            })
-                            continue
+                # Ejecutar servicio real (GCal/DB/etc.) con manejo de errores
+                try:
+                    result = self._dispatch_tool(tool_name, tool_args)
+                except Exception as e:
+                    current_app.logger.exception("[Tool] %s falló", tool_name)
+                    result = {"ok": False, "error": str(e)}
 
-                        if dt_final.tzinfo is None:
-                            dt_final = dt_final.replace(tzinfo=local_tz)
-                        else:
-                            dt_final = dt_final.astimezone(local_tz)
-                        # ISO local para GoogleCalendarService
-                        args["date"] = dt_final.strftime("%Y-%m-%dT%H:%M")
-
-                    try:
-                        result = self._execute_function(name, **args)
-                        if isinstance(result, dict):
-                            tool_outputs.append({
-                                "tool_call_id": call.id,
-                                "output": json.dumps(result, ensure_ascii=False)
-                            })
-                        else:
-                            tool_outputs.append({
-                                "tool_call_id": call.id,
-                                "output": json.dumps({"message": str(result or "")}, ensure_ascii=False)
-                            })
-                    except Exception as e:
-                        current_app.logger.exception("[Tool] error en %s", name)
-                        tool_outputs.append({
-                            "tool_call_id": call.id,
-                            "output": json.dumps({"error": str(e)}, ensure_ascii=False)
-                        })
-
-                client.beta.threads.runs.submit_tool_outputs(
-                    thread_id=thread_id,
-                    run_id=run.id,
-                    tool_outputs=tool_outputs
+                # Devolver resultado de tool correlacionado por call_id y encadenado al response previo
+                resp = responses_create(
+                    model=current_app.config["OPENAI_MODEL"],
+                    instructions=instructions,  
+                    input_items=[{
+                        "role": "tool",
+                        "call_id": fc.call_id,     # <-- correlación Responses
+                        "content": [{
+                            "type": "output_text",
+                            "text": json.dumps(result, ensure_ascii=False)
+                        }]
+                    }],
+                    tools=tools,                 # dejar habilitadas por si encadena otra tool
+                    conversation_id=conv_id,
+                    previous_response_id=prev_id,
+                    stream=False,
+                    store=True,
+                    #strict=True
                 )
-                continue
+                prev_id = getattr(resp, "id", prev_id)
 
-            # b) Si completó, devolver texto
-            if run.status == "completed":
-                thread_msgs = client.beta.threads.messages.list(thread_id=thread_id, limit=1)
-                if not thread_msgs.data:
-                    return "Listo."
-                return self._unwrap_message(thread_msgs.data[0])
+        # --- 3) Texto final ---
+        final_text = getattr(resp, "output_text", None) or self._render_text(getattr(resp, "output", []))
+        return final_text
 
-            if run.status in ("failed", "expired", "cancelled"):
-                return "Se interrumpió el proceso, probemos de nuevo."
-
-            time.sleep(0.35)  # backoff leve
 
     # ------------------------------------------------------------------
     # Recordatorios

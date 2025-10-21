@@ -13,6 +13,7 @@ class _Settings:
     GRAPH_API_VERSION: str
     TZ: str
     DEBUG: bool
+    OPENAI_MODEL: str
 
 def load_settings() -> _Settings:
     return _Settings(
@@ -26,6 +27,7 @@ def load_settings() -> _Settings:
         GRAPH_API_VERSION=os.getenv("GRAPH_API_VERSION", "23.0"),
         TZ=os.getenv("TZ", "America/Montevideo"),
         DEBUG=(os.getenv("DEBUG", "false").lower() == "true"),
+        OPENAI_MODEL=os.getenv("OPENAI_MODEL", "gpt-3.5-turbo")
     )
 
 SETTINGS = load_settings()

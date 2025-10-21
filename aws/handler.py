@@ -16,7 +16,7 @@ from sqlalchemy.pool import NullPool
 from app.models import db, Turn, Reminder, ScheduledMessage, Customer
 from app.utils.phone_utils import normalize_phone_e164
 from uuid import uuid4
-from app.services.openai_service import client as openai_client , get_or_create_thread
+from app.services.openai_service import client as openai_client , get_or_create_conversation
 from app.services.orchestrator import Orchestrator
 from app.services import scheduler_service
 from app.utils.whatsapp_utils import (
@@ -29,6 +29,11 @@ from app.config.settings import SETTINGS
 
 # ── Bootstrapping ───────────────────────────────────────────────
 APP = Flask(__name__)
+
+# Load settings into Flask config
+from app.config.settings import SETTINGS
+for key, value in SETTINGS.__dict__.items():
+    APP.config[key] = value
 
 # DB_URL: corrige el "or" mal puesto (Render / Supabase)
 DB_URL = (
@@ -337,23 +342,23 @@ def lambda_handler(event, context):
 
     # 2.5) Asegurar/obtener thread activo (idempotente y sin carrera)
     try:
-        thread_id = get_or_create_thread(
+        conversation_id = get_or_create_conversation(
             wa_id=wa_id,
             customer_id=None,  # si lo resolvés antes, pasalo aquí
             correlation_id=correlation_id,
             last_wa_msg_id=wamid,
         )
         logging.info(
-            "[WEBHOOK] get_or_create_thread OK",
-            extra={"correlation_id": correlation_id, "wa_id": wa_id, "wamid": wamid, "thread_id": thread_id},
+            "[WEBHOOK] get_or_create_conversation OK",
+            extra={"correlation_id": correlation_id, "wa_id": wa_id, "wamid": wamid, "conversation_id": conversation_id},
         )
     except Exception:
         # Hardening: no tiramos 5xx al webhook; log y seguimos (el orchestrator también reintenta)
         logging.exception(
-            "[WEBHOOK] get_or_create_thread falló (se continúa para no interrumpir el flujo)",
+            "[WEBHOOK] get_or_create_conversation falló (se continúa para no interrumpir el flujo)",
             extra={"correlation_id": correlation_id, "wa_id": wa_id, "wamid": wamid},
         )
-        thread_id = None  # opcional: si no querés romper flujos posteriores
+        conversation_id = None  # opcional: si no querés romper flujos posteriores
 
     # 2.6) Orchestrator → respuesta
     bot_reply = orchestrator.handle_message(user_msg or "", wa_id, name, wamid)

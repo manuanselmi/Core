@@ -5,7 +5,6 @@
       "function": {
         "name": "create_reminder",
         "description": "Crea un reminder en el calendario interno y agenda recordatorio por WhatsApp.",
-        "strict": true,
         "parameters": {
           "type": "object",
           "properties": {
@@ -32,7 +31,6 @@
       "function": {
         "name": "lookup_customer",
         "description": "Busca la información del cliente por su ID.",
-        "strict": true,
         "parameters": {
           "type": "object",
           "properties": {
@@ -51,7 +49,6 @@
       "function": {
         "name": "notify_creators",
         "description": "Se llama cuando el usuario quiere que el bot avise a sus creadores o desarrolladores.",
-        "strict": true,
         "parameters": {
           "type": "object",
           "properties": {
@@ -73,14 +70,13 @@
       "type": "function",
       "function": {
         "name": "check_availability",
-        "description": "Devuelve bloques libres en Google Calendar para la fecha indicada (TZ = America/Montevideo).",
+        "description": "Devuelve los bloques libres en Google Calendar para la fecha indicada.",
         "parameters": {
           "type": "object",
           "properties": {
-            "date":        { "type": "string",  "description": "YYYY-MM-DD" },
-            "start_time":  { "type": "string",  "description": "HH:MM (24h). Default: 08:00" },
-            "end_time":    { "type": "string",  "description": "HH:MM (24h). Default: 20:00" },
-            "slot_minutes":{ "type": "integer", "description": "Duración de cada bloque en minutos", "minimum": 15, "default": 60 }
+            "date":       { "type": "string", "description": "YYYY-MM-DD (zona: America/Montevideo)" },
+            "start_time": { "type": "string", "description": "HH:MM (opcional)" },
+            "end_time":   { "type": "string", "description": "HH:MM (opcional)" }
           },
           "required": ["date"],
           "additionalProperties": false
@@ -91,11 +87,11 @@
       "type": "function",
       "function": {
         "name": "schedule_meeting",
-        "description": "Agenda una reunión en Google Calendar si el horario está libre (TZ = America/Montevideo).",
+        "description": "Agenda una reunión en Google Calendar si el horario está libre.",
         "parameters": {
           "type": "object",
           "properties": {
-            "date":             { "type": "string",  "description": "Inicio local ISO: YYYY-MM-DDTHH:MM (ej. 2025-10-21T08:00)" },
+            "date":             { "type": "string",  "description": "Inicio local ISO: YYYY-MM-DDTHH:MM (America/Montevideo)" },
             "title":            { "type": "string",  "description": "Título del evento." },
             "duration_minutes": { "type": "integer", "description": "Duración en minutos.", "minimum": 15, "default": 60 },
             "description":      { "type": "string",  "description": "Notas/Descripción del evento.", "default": "" }
