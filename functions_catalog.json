@@ -2,122 +2,203 @@
   "tools": [
     {
       "type": "function",
-      "function": {
-        "name": "create_reminder",
-        "description": "Crea un reminder en el calendario interno y agenda recordatorio por WhatsApp.",
-        "parameters": {
-          "type": "object",
-          "properties": {
-            "date": {
-              "type": "string",
-              "description": "Fecha y hora del reminder. Acepta 'YYYY-MM-DD HH:MM', 'YYYY-MM-DDTHH:MM[:SS]' o solo 'HH:MM' (se interpreta como hoy)."
-            },
-            "title": {
-              "type": "string",
-              "description": "Título descriptivo del reminder"
-            },
-            "wa_msg_id": {
-              "type": "string",
-              "description": "ID del mensaje de WhatsApp asociado (opcional)."
-            }
+      "name": "create_reminder",
+      "description": "Crea un reminder en el calendario interno y agenda recordatorio por WhatsApp.",
+      "parameters": {
+        "type": "object",
+        "properties": {
+          "date": {
+            "type": "string",
+            "description": "Fecha y hora del reminder. Acepta 'YYYY-MM-DD HH:MM', 'YYYY-MM-DDTHH:MM[:SS]' o solo 'HH:MM' (se interpreta como hoy)."
           },
-          "required": ["date", "title"],
-          "additionalProperties": false
-        }
+          "title": {
+            "type": "string",
+            "description": "Título descriptivo del reminder"
+          },
+          "wa_msg_id": {
+            "type": "string",
+            "description": "ID del mensaje de WhatsApp asociado (opcional)."
+          }
+        },
+        "required": ["date", "title"],
+        "additionalProperties": false
       }
     },
     {
       "type": "function",
-      "function": {
-        "name": "lookup_customer",
-        "description": "Busca la información del cliente por su ID.",
-        "parameters": {
-          "type": "object",
-          "properties": {
-            "customer_id": {
-              "type": "integer",
-              "description": "ID del cliente"
-            }
-          },
-          "required": ["customer_id"],
-          "additionalProperties": false
-        }
+      "name": "lookup_customer",
+      "description": "Busca la información del cliente por su ID.",
+      "parameters": {
+        "type": "object",
+        "properties": {
+          "customer_id": {
+            "type": "integer",
+            "description": "ID del cliente"
+          }
+        },
+        "required": ["customer_id"],
+        "additionalProperties": false
       }
     },
     {
       "type": "function",
-      "function": {
-        "name": "notify_creators",
-        "description": "Se llama cuando el usuario quiere que el bot avise a sus creadores o desarrolladores.",
-        "parameters": {
-          "type": "object",
-          "properties": {
-            "user_message": {
-              "type": "string",
-              "description": "Mensaje original del usuario."
-            },
-            "sender_name": {
-              "type": "string",
-              "description": "Nombre del usuario que envía el reporte."
-            }
+      "name": "notify_creators",
+      "description": "Se llama cuando el usuario quiere que el bot avise a sus creadores o desarrolladores.",
+      "parameters": {
+        "type": "object",
+        "properties": {
+          "user_message": {
+            "type": "string",
+            "description": "Mensaje original del usuario."
           },
-          "required": ["user_message", "sender_name"],
-          "additionalProperties": false
-        }
+          "sender_name": {
+            "type": "string",
+            "description": "Nombre del usuario que envía el reporte."
+          }
+        },
+        "required": ["user_message", "sender_name"],
+        "additionalProperties": false
       }
     },
     {
       "type": "function",
-      "function": {
-        "name": "check_availability",
-        "description": "Devuelve los bloques libres en Google Calendar para la fecha indicada.",
-        "parameters": {
-          "type": "object",
-          "properties": {
-            "date":       { "type": "string", "description": "YYYY-MM-DD (zona: America/Montevideo)" },
-            "start_time": { "type": "string", "description": "HH:MM (opcional)" },
-            "end_time":   { "type": "string", "description": "HH:MM (opcional)" }
+      "name": "check_availability",
+      "description": "Devuelve los bloques libres en Google Calendar para la fecha indicada.",
+      "parameters": {
+        "type": "object",
+        "properties": {
+          "date": {
+            "type": "string",
+            "description": "YYYY-MM-DD (zona: America/Montevideo)"
           },
-          "required": ["date"],
-          "additionalProperties": false
-        }
+          "start_time": {
+            "type": "string",
+            "description": "HH:MM (opcional) - hora de inicio de la ventana de búsqueda"
+          },
+          "end_time": {
+            "type": "string",
+            "description": "HH:MM (opcional) - hora de fin de la ventana de búsqueda"
+          },
+          "slot_minutes": {
+            "type": "integer",
+            "description": "Duración deseada de cada bloque libre en minutos",
+            "default": 60,
+            "minimum": 15
+          }
+        },
+        "required": ["date"],
+        "additionalProperties": false
       }
     },
     {
       "type": "function",
-      "function": {
-        "name": "schedule_meeting",
-        "description": "Agenda una reunión en Google Calendar si el horario está libre.",
-        "parameters": {
-          "type": "object",
-          "properties": {
-            "date":             { "type": "string",  "description": "Inicio local ISO: YYYY-MM-DDTHH:MM (America/Montevideo)" },
-            "title":            { "type": "string",  "description": "Título del evento." },
-            "duration_minutes": { "type": "integer", "description": "Duración en minutos.", "minimum": 15, "default": 60 },
-            "description":      { "type": "string",  "description": "Notas/Descripción del evento.", "default": "" }
-          },
-          "required": ["date", "title"],
-          "additionalProperties": false
-        }
+      "name": "schedule_meeting",
+      "description": "Agenda una reunión en Google Calendar si el horario está libre.",
+      "parameters": {
+        "type": "object",
+        "properties": {
+          "date":             { "type": "string",  "description": "Inicio local ISO: YYYY-MM-DDTHH:MM (America/Montevideo)" },
+          "title":            { "type": "string",  "description": "Título del evento (se estandariza internamente)." },
+          "duration_minutes": { "type": "integer", "description": "Duración en minutos.", "minimum": 15, "default": 60 }
+        },
+        "required": ["date", "title"],
+        "additionalProperties": false
       }
     },
     {
       "type": "function",
-      "function": {
-        "name": "enviar_mensaje",
-        "description": "Envía (o programa) un mensaje de WhatsApp a un tercero.",
-        "parameters": {
-          "type": "object",
-          "properties": {
-            "telefono":   { "type": "string", "description": "Número con código de país, formato +598..." },
-            "mensaje":    { "type": "string", "description": "Texto a enviar" },
-            "fecha_hora": { "type": "string", "description": "ISO-8601 en America/Montevideo; si se omite/es null, se envía ahora." }
+      "name": "enviar_mensaje",
+      "description": "Envía o programa un mensaje de WhatsApp a un número específico. Puede ser inmediato o programado.",
+      "parameters": {
+        "type": "object",
+        "properties": {
+          "telefono": {
+            "type": "string",
+            "description": "Número de teléfono destino (puede incluir código de país o formato local uruguayo)"
           },
-          "required": ["telefono", "mensaje"],
-          "additionalProperties": false
-        }
+          "mensaje": {
+            "type": "string",
+            "description": "Texto del mensaje a enviar"
+          },
+          "fecha_hora": {
+            "type": "string",
+            "description": "Fecha y hora para programar el envío (formato natural o ISO). Si se omite, se envía inmediatamente."
+          }
+        },
+        "required": ["telefono", "mensaje"],
+        "additionalProperties": false
+      }
+    },
+    {
+      "type": "function",
+      "name": "cancel_scheduled_message",
+      "description": "Cancela un mensaje programado previamente.",
+      "parameters": {
+        "type": "object",
+        "properties": {
+          "phone_id": {
+            "type": "string",
+            "description": "Teléfono del usuario que creó el mensaje"
+          },
+          "context_id": {
+            "type": "string",
+            "description": "ID del mensaje de WhatsApp de referencia (opcional)"
+          },
+          "wa_msg_id": {
+            "type": "string",
+            "description": "ID alternativo del mensaje de WhatsApp (fallback)"
+          }
+        },
+        "required": ["phone_id"],
+        "additionalProperties": false
+      }
+    },
+    {
+      "type": "function",
+      "name": "cancel_reminder",
+      "description": "Cancela un recordatorio previamente creado.",
+      "parameters": {
+        "type": "object",
+        "properties": {
+          "phone_id": {
+            "type": "string",
+            "description": "Teléfono del usuario dueño del recordatorio"
+          },
+          "context_id": {
+            "type": "string",
+            "description": "ID del mensaje de WhatsApp de referencia (opcional)"
+          },
+          "wa_msg_id": {
+            "type": "string",
+            "description": "ID alternativo del mensaje de WhatsApp (fallback)"
+          }
+        },
+        "required": ["phone_id"],
+        "additionalProperties": false
+      }
+    },
+    {
+      "type": "function",
+      "name": "get_weather",
+      "description": "Obtiene el pronóstico del clima para una ciudad.",
+      "parameters": {
+        "type": "object",
+        "properties": {
+          "city": {
+            "type": "string",
+            "description": "Nombre de la ciudad",
+            "default": "Montevideo"
+          },
+          "units": {
+            "type": "string",
+            "description": "Sistema de unidades (metric o imperial)",
+            "default": "metric",
+            "enum": ["metric", "imperial"]
+          }
+        },
+        "required": [],
+        "additionalProperties": false
       }
     }
   ]
 }
-

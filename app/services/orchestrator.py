@@ -2,16 +2,17 @@ import re
 import json
 import os
 import logging
-import time
-from datetime import timedelta, datetime, date
-from uuid import uuid4
-from sqlalchemy.exc import IntegrityError
+from datetime import timedelta, datetime
 from zoneinfo import ZoneInfo
-from openai import OpenAI
+from openai import OpenAI, BadRequestError
 import dateparser
 from app.services.responses_service import (
     get_or_create_conversation_id,
     responses_create,
+    set_last_response_id,
+    reset_conversation_for_phone,
+    build_function_call_output,
+    continue_with_function_outputs,
 )
 from pathlib import Path
 from functools import lru_cache
@@ -19,21 +20,15 @@ from app.prompts import load_kairito
 from flask import current_app 
 
 from requests import Session
-
-from app.services.bot_logic import BotLogic
 from app.services.customer_service import CustomerService
 from app.services.calendar_service import CalendarService
 import app.services.scheduler_service as scheduler_service
 from app.utils.datetime_utils import parse_iso8601
 from app.services.weather_service import get_forecast
-from app.services.memory_service import Memory
-from app.utils.datetime_normalizer import normalize_to_future
-import datetime as dt
 from app.models import db, Reminder, Customer, ScheduledMessage
-from app.services.google_calendar_service import CALENDAR_ID, GoogleCalendarService
+from app.services.google_calendar_service import GoogleCalendarService
 from app.services.send_message_flow import SendMessageFlow
 from zoneinfo import ZoneInfo
-import os
 
 LOCAL_TZ_STR = os.getenv("TZ", "America/Montevideo")
 
@@ -47,34 +42,45 @@ _WD_MAP = {
     "Sunday": "domingo"
 }
 
-def build_extra_instructions(user_name: str | None) -> str:
+ 
+
+
+# ---------------- Helpers Responses/tool-calls ---------------------
+def extract_tool_calls(resp) -> list:
     """
-    Construye instrucciones adicionales para el Assistant con fecha/hora actual.
-    Mantiene formato y contenido exacto del legacy para compatibilidad.
+    Detect tool/function calls in a Responses result.
+    - Prefer required_action.submit_tool_outputs.tool_calls in the caller,
+      but this helper scans resp.output for top-level items and nested parts.
+    Returns a list of call-like objects (SDK-specific structures).
     """
-    local_tz = ZoneInfo(LOCAL_TZ_STR)
-    now = datetime.now(local_tz)
-    weekday_es = _WD_MAP[now.strftime('%A')]
+    import logging
+    calls: list = []
+    out_items = getattr(resp, "output", []) or []
+    try:
+        logging.getLogger("Orchestrator").debug(
+            "[RESP] out types=%s",
+            [getattr(i, "type", None) for i in out_items]
+        )
+    except Exception:
+        pass
+
+    for it in out_items:
+        t = getattr(it, "type", None)
+        # Top-level tool/function call
+        if t in ("function_call", "tool_call"):
+            calls.append(it)
+        # Nested under message.content[*]
+        if t == "message":
+            for part in getattr(it, "content", []) or []:
+                pt = getattr(part, "type", None)
+                if pt in ("tool_use", "function_call", "tool_call"):
+                    calls.append(part)
+    return calls
     
-    return (
-        f"Usá la tool correcta según corresponda, una sola por turno. "
-        f"Perfil del usuario: se llama '{user_name}'. "
-        f"Si el usuario pregunta '¿cómo me llamo?' o similar, respondé '{user_name}'. "
-        f"Podés saludar o referirte a él por ese nombre cuando tenga sentido. "
-        f"La fecha y hora actual es {now.strftime('%d/%m/%Y %H:%M')} "
-        f"y el día de hoy es {weekday_es}."
-    )
-
-def log_http_response(response):
-    logging.info(f"Status: {response.status_code}")
-    logging.info(f"Content-type: {response.headers.get('content-type')}")
-    logging.info(f"Body: {response.text}")
-
 class Orchestrator:
     def __init__(self, client: OpenAI, db_session: Session, catalog_path: str = "functions_catalog.json"):
         self.client = client
         self.db = db_session
-        self.bot_logic = BotLogic()
         self.catalog_path = catalog_path
         self.current_customer_id = None
         self.current_phone = None
@@ -114,7 +120,7 @@ class Orchestrator:
         self.current_name = name
 
         # Assistants (igual)
-        reply = self._assistant_reply(user.get("phone"), message or "", name)
+        reply = self._assistant_reply(user.get("phone"), message or "", name, wa_msg_id)
         return reply
     
     # ---------- Tools catalog loader ----------
@@ -179,90 +185,11 @@ class Orchestrator:
                 pass
         return tools
 
-
-    # ---------------- Dispatcher para tools ---------------------
-    def _execute_function(self, tool_name: str, **kwargs):
-        """
-        Dispatcher para tool calls del Assistant.
-        - Mapea cada tool del catálogo a un método del Orchestrator.
-        - Inyecta defaults y sanea args mínimos cuando corresponde.
-        - Mantiene compatibilidad con funciones ya existentes (fallback getattr).
-        """
-
-        # 🔧 Inyecciones/saneos por tool (no crean coupling con el LLM)
-        if tool_name == "notify_creators":
-            kwargs.setdefault(
-                "sender_name",
-                getattr(self, "current_user_name", None) or getattr(self, "current_phone", None)
-            )
-
-        elif tool_name == "schedule_meeting":
-            kwargs.setdefault("duration_minutes", 60)
-
-        elif tool_name == "enviar_mensaje":
-            if not kwargs.get("fecha_hora"):
-                kwargs["fecha_hora"] = None
-
-        elif tool_name == "lookup_customer":
-            cid = kwargs.get("customer_id")
-            if cid is not None:
-                try:
-                    kwargs["customer_id"] = int(cid)
-                except Exception:
-                    pass
-
-        dispatch = {
-            # Calendario / Agenda
-            "create_reminder":       self.create_reminder,
-            "check_availability": getattr(self, "check_availability", None),
-            "schedule_meeting":   getattr(self, "schedule_meeting", None),
-
-            # Clima
-            "get_weather":        getattr(self, "get_weather", None),
-
-            # Clientes
-            "lookup_customer":    getattr(self, "lookup_customer", None),
-
-            # Notificaciones a creadores
-            "notify_creators":    getattr(self, "notify_creators", None),
-
-            # Mensajería a terceros
-            "enviar_mensaje":     getattr(self, "enviar_mensaje", None),
-
-            # Documentos
-            "summarize_pdf":      getattr(self, "summarize_pdf", None),
-        }
-
-        fn = dispatch.get(tool_name) or getattr(self, tool_name, None)
-        if not callable(fn):
-            raise ValueError(f"Tool desconocida o no callable: {tool_name}")
-
-        return fn(**kwargs)
-
-
-
     # ---------------- Helper para extraer texto de mensajes ------------
-    def _unwrap_message(self, m) -> str:
-        try:
-            for part in getattr(m, "content", []) or []:
-                t = getattr(part, "type", None)
-                if t == "text" and hasattr(part, "text"):
-                    return part.text.value
-                if t == "refusal" and hasattr(part, "refusal"):
-                    # por si el assistant devuelve una negativa estructurada
-                    return part.refusal
-            # fallback mínimo
-            if hasattr(m, "content") and isinstance(m.content, list) and m.content:
-                # intentar value plano si existe
-                c0 = m.content[0]
-                if hasattr(c0, "text") and hasattr(c0.text, "value"):
-                    return c0.text.value
-        except Exception:
-            pass
-        return "Listo."
+    # _unwrap_message deprecated (not used). Using _render_text instead.
 
     # ---------------- Core: integrar con Assistants API ----------------
-    def _assistant_reply(self, wa_id: str, user_msg: str, user_name: str | None = None) -> str | dict:
+    def _assistant_reply(self, wa_id: str, user_msg: str, user_name: str | None = None, wa_msg_id: str | None = None) -> str | dict:
         """
         Envía el mensaje a OpenAI Responses y devuelve el texto final.
         Si hay tool-calls, las ejecuta y encadena hasta obtener respuesta final.
@@ -270,7 +197,8 @@ class Orchestrator:
         # --- Contexto base ---
         wa_phone = wa_id  # si tenes normalizador E.164, usalo acá
         correlation_id = getattr(current_app, "correlation_id", None)
-        wa_msg_id = os.getenv("CURRENT_WAMID")  # si lo cargas en contexto/env
+        # Propagate WhatsApp message id for idempotency/metadata
+        wa_msg_id = wa_msg_id or os.getenv("CURRENT_WAMID") 
 
         # Conversación (estado persistente tipo threads)
         conv_id = get_or_create_conversation_id(
@@ -279,7 +207,7 @@ class Orchestrator:
             correlation_id=correlation_id,
             last_wa_msg_id=wa_msg_id
         )
-
+        
         # Tools (de tu catálogo). Asegurate que esta función devuelva la lista (no el dict raíz)
         tools = self._load_tools_catalog()
         if isinstance(tools, dict) and "tools" in tools:
@@ -289,6 +217,7 @@ class Orchestrator:
         now = datetime.now(ZoneInfo(current_app.config.get("TZ", "America/Montevideo")))
         extra_instr = (
             f"\n\n[Instrucciones de runtime]\n"
+            f"- El usuario se llama: {user_name or 'Usuario'}.\n"
             f"- Fecha/Hora actual: {now.strftime('%Y-%m-%d %H:%M')} ({now.tzinfo})\n"
             f"- Usá SIEMPRE esta zona horaria para interpretar/mostrar horarios.\n"
             f"- Stage: {current_app.config.get('STAGE','local')}\n"
@@ -296,68 +225,264 @@ class Orchestrator:
         instructions = base_instr + extra_instr
 
         # --- 1) Primera llamada: el modelo puede pedir function_call(s) ---
-        resp = responses_create(
-            model=current_app.config["OPENAI_MODEL"],
-            instructions=instructions,
-            input_items=[{
-                "role": "user",
-                "content": [{"type": "input_text", "text": user_msg}]
-            }],
-            tools=tools,
-            conversation_id=conv_id,
-            stream=False,              # Síncrono (no SSE). La memoria persiste igual por conversation+store.
-            tool_choice="auto",
-            store=True,
-            #strict=True,
-            metadata={"wa_id": wa_phone, "wa_msg_id": wa_msg_id}
-        )
+        # Idempotency key for first turn (deterministic per conv + wamid)
+        first_idem = f"resp:{conv_id}:{wa_msg_id or 'none'}:turn0"
+        # Feature flag to disable parallel tool calls for compatibility
+        disable_parallel = os.getenv("DISABLE_PARALLEL_TOOL_CALLS", "true").lower() in ("1", "true", "yes")
+        if disable_parallel:
+            current_app.logger.info("[RESP] parallel_tool_calls disabled")
+        try:
+            resp = responses_create(
+                model=current_app.config["OPENAI_MODEL"],
+                instructions=instructions,
+                input_items=[{
+                    "role": "user",
+                    "content": [{"type": "input_text", "text": user_msg}]
+                }],
+                tools=tools,
+                conversation_id=conv_id,
+                stream=False,
+                tool_choice="auto",
+                store=True,
+                metadata={"wa_id": wa_phone, "wa_msg_id": wa_msg_id},
+                idempotency_key=first_idem,
+                parallel_tool_calls=False if disable_parallel else None,
+            )
+        except BadRequestError as e:
+            msg = str(e) or ""
+            if "No tool output found" in msg:
+                # Soft reset: create a fresh conversation without deleting the old one, then retry once
+                current_app.logger.warning(
+                    "[RESP] dirty conversation for %s (conv=%s). Soft-rotating and retrying once.",
+                    wa_phone, conv_id
+                )
+                conv_id = reset_conversation_for_phone(wa_phone, delete_remote=False)
+                first_idem = f"resp:{conv_id}:{wa_msg_id or 'none'}:turn0"
+                resp = responses_create(
+                    model=current_app.config["OPENAI_MODEL"],
+                    instructions=instructions,
+                    input_items=[{
+                        "role": "user",
+                        "content": [{"type": "input_text", "text": user_msg}]
+                    }],
+                    tools=tools,
+                    conversation_id=conv_id,
+                    stream=False,
+                    tool_choice="auto",
+                    store=True,
+                    metadata={"wa_id": wa_phone, "wa_msg_id": wa_msg_id},
+                    idempotency_key=first_idem,
+                    parallel_tool_calls=False if disable_parallel else None,
+                )
+            else:
+                raise
 
         prev_id = getattr(resp, "id", None)
+        if prev_id:
+            set_last_response_id(wa_phone, prev_id)
 
         # --- 2) Loop: ejecutar tools y encadenar con previous_response_id ---
         while True:
-            output_items = getattr(resp, "output", []) or []
-            f_calls = [it for it in output_items if getattr(it, "type", "") == "function_call"]
+            # 1) Preferir la ruta oficial: required_action.submit_tool_outputs.tool_calls
+            req_action = getattr(resp, "required_action", None)
+            tool_calls = []
+            if req_action and getattr(req_action, "type", None) == "submit_tool_outputs":
+                sto = getattr(req_action, "submit_tool_outputs", None)
+                if sto:
+                    tool_calls = getattr(sto, "tool_calls", []) or []
 
-            if not f_calls:
+            # 2) Fallback robusto: buscar en resp.output incluyendo partes anidadas
+            if not tool_calls:
+                tool_calls = extract_tool_calls(resp)
+
+            # Observabilidad: IDs y cantidad detectada
+            ids_detectadas = [
+                getattr(c, "call_id", None) or getattr(c, "id", None) or getattr(c, "tool_call_id", None)
+                for c in (tool_calls or [])
+            ]
+            current_app.logger.debug(
+                "[TOOL] detectadas=%d ids=%s",
+                len(tool_calls or []), ids_detectadas
+            )
+
+            if not tool_calls:
+                # Observabilidad adicional para depurar ausencias de tool-calls
+                try:
+                    out_items = getattr(resp, "output", []) or []
+                    msg_types = []
+                    for it in out_items:
+                        t = getattr(it, "type", None)
+                        if t == "message":
+                            msg_types.extend([getattr(p, "type", None) for p in (getattr(it, "content", []) or [])])
+                    current_app.logger.warning(
+                        "[RESP] no tool calls found. resp.id=%s out_types=%s message.part.types=%s",
+                        getattr(resp, "id", None),
+                        [getattr(i, "type", None) for i in out_items],
+                        msg_types,
+                    )
+                except Exception:
+                    pass
                 break  # no hay más tools → tenemos respuesta final
 
-            for fc in f_calls:
-                tool_name = fc.name
-                tool_args = json.loads(fc.arguments or "{}")
+            call_ids: list[str] = []
+            batched_results: list[dict] = []
+            for fc in tool_calls:
+                # Compatibilidad: estructura distinta según SDK
+                tool_name = getattr(fc, "name", None)
+
+                # Leer argumentos desde arguments (str/dict) o input (dict)
+                tool_args = {}
+                raw_args = getattr(fc, "arguments", None)
+                if isinstance(raw_args, str):
+                    try:
+                        tool_args = json.loads(raw_args)
+                    except Exception:
+                        tool_args = {}
+                elif isinstance(raw_args, dict):
+                    tool_args = raw_args
+                if not tool_args:
+                    alt_input = getattr(fc, "input", None)
+                    if isinstance(alt_input, dict):
+                        tool_args = alt_input
+                    else:
+                        tool_args = {}
+
+                # Id del llamado a la tool (depende de la representación)
+                call_id = (
+                    getattr(fc, "call_id", None)
+                    or getattr(fc, "id", None)
+                    or getattr(fc, "tool_call_id", None)
+                )
+                if not call_id:
+                    current_app.logger.warning("[TOOL] %s sin call_id; se omite para evitar inconsistencias", tool_name)
+                    continue
 
                 # Ejecutar servicio real (GCal/DB/etc.) con manejo de errores
                 try:
                     result = self._dispatch_tool(tool_name, tool_args)
+                    current_app.logger.info("[TOOL] %s ejecutada → result type=%s", tool_name, type(result).__name__)
+                    if result is None:
+                        current_app.logger.warning("[TOOL] %s devolvió None, usando dict con error", tool_name)
+                        result = {"error": "tool_returned_none"}
                 except Exception as e:
-                    current_app.logger.exception("[Tool] %s falló", tool_name)
+                    current_app.logger.exception("[TOOL] %s falló", tool_name)
                     result = {"ok": False, "error": str(e)}
 
-                # Devolver resultado de tool correlacionado por call_id y encadenado al response previo
-                resp = responses_create(
-                    model=current_app.config["OPENAI_MODEL"],
-                    instructions=instructions,  
-                    input_items=[{
-                        "role": "tool",
-                        "call_id": fc.call_id,     # <-- correlación Responses
-                        "content": [{
-                            "type": "output_text",
-                            "text": json.dumps(result, ensure_ascii=False)
-                        }]
-                    }],
-                    tools=tools,                 # dejar habilitadas por si encadena otra tool
-                    conversation_id=conv_id,
-                    previous_response_id=prev_id,
-                    stream=False,
-                    store=True,
-                    #strict=True
+                call_ids.append(call_id)
+                # Serialize output as JSON string per Responses API contract
+                out_str = json.dumps(result if result is not None else {}, ensure_ascii=False)
+                current_app.logger.info("[TOOL] %s → call_id=%s output_len=%d", tool_name, call_id, len(out_str))
+                batched_results.append({
+                    "tool_call_id": call_id,
+                    "output": out_str,
+                })
+
+            if not batched_results:
+                current_app.logger.warning("[CONT] no hubo outputs válidos para enviar; corto el loop para evitar bucles.")
+                break
+
+            # Construir function_call_output items (uno por cada tool-call)
+            fc_outputs: list[dict] = []
+            for br in batched_results:
+                fc_outputs.append(
+                    build_function_call_output(
+                        call_id=br.get("tool_call_id"),
+                        output_json_string=br.get("output", "{}"),
+                    )
                 )
-                prev_id = getattr(resp, "id", prev_id)
+
+            # Validación: no enviar parcial
+            if len(fc_outputs) != len(tool_calls):
+                current_app.logger.error(
+                    "[CONT] outputs=%d pero tool_calls=%d → no envío parcial; corto para evitar 400",
+                    len(fc_outputs), len(tool_calls)
+                )
+                break
+
+            # Enviar una sola continuación con todas las devoluciones de esta ronda
+            current_app.logger.info(
+                "[CONT] sending prev_id=%s call_ids=%s count=%d",
+                prev_id, call_ids, len(fc_outputs)
+            )
+            # Log detallado de lo que vamos a enviar
+            for idx, br in enumerate(fc_outputs):
+                current_app.logger.debug(
+                    "[CONT] output %d: call_id=%s preview=%s",
+                    idx, br.get("call_id"), br.get("output", "")[:200]
+                )
+            # Deterministic idempotency key for this follow-up
+            follow_idem = f"resp:{conv_id}:{wa_msg_id or 'none'}:follow:{prev_id}"
+            current_app.logger.info(
+                "[CONT] returning %d outputs prev_id=%s ids=%s",
+                len(fc_outputs), prev_id, [o.get("call_id") for o in fc_outputs]
+            )
+            resp = continue_with_function_outputs(
+                model=current_app.config["OPENAI_MODEL"],
+                previous_response_id=prev_id,
+                outputs=fc_outputs,
+                idempotency_key=follow_idem,
+                tools=tools,
+                disable_parallel=disable_parallel,
+                timeout_s=17.0,
+            )
+            current_app.logger.debug(
+                "[CONT] response.id=%s status=%s",
+                getattr(resp, "id", None), getattr(resp, "status", None),
+            )
+            if not resp:
+                current_app.logger.error(
+                    "[CONT] continuation aborted due to invalid outputs; breaking to avoid loop."
+                )
+                break
+            prev_id = getattr(resp, "id", prev_id)
+            if prev_id:
+                set_last_response_id(wa_phone, prev_id)
 
         # --- 3) Texto final ---
         final_text = getattr(resp, "output_text", None) or self._render_text(getattr(resp, "output", []))
         return final_text
 
+    def _dispatch_tool(self, tool_name: str, tool_args: dict) -> dict | None:
+        """
+        Despacha la ejecución de una tool function a su método correspondiente.
+        Retorna el resultado en formato dict o None.
+        """
+        # Mapeo de nombres de tools a métodos
+        tool_map = {
+            "create_reminder": self.create_reminder,
+            "cancel_reminder": self.cancel_reminder,
+            "lookup_customer": self.lookup_customer,
+            "get_weather": self.get_weather,
+            "schedule_meeting": self.schedule_meeting,
+            "check_availability": self.check_availability,
+            "enviar_mensaje": self.enviar_mensaje,
+            "cancel_scheduled_message": self.cancel_scheduled_message,
+        }
+        
+        handler = tool_map.get(tool_name)
+        if not handler:
+            current_app.logger.warning("[_dispatch_tool] Unknown tool: %s", tool_name)
+            return {"error": f"Unknown tool: {tool_name}"}
+        # Sanitizar args para tools conocidas (evita TypeError por campos legacy)
+        if tool_name == "schedule_meeting":
+            allowed = {"date", "duration_minutes", "title", "calendar_id"}
+            tool_args = {k: v for k, v in (tool_args or {}).items() if k in allowed}
+        
+        return handler(**(tool_args or {}))
+
+    def _render_text(self, output_items: list) -> str:
+        """
+        Extrae texto de output items de Responses API.
+        Fallback si output_text no está disponible.
+        """
+        for item in output_items or []:
+            item_type = getattr(item, "type", None)
+            if item_type == "message":
+                content = getattr(item, "content", []) or []
+                for part in content:
+                    if getattr(part, "type", None) == "text":
+                        return getattr(part, "text", "Listo.")
+        return "Listo."
 
     # ------------------------------------------------------------------
     # Recordatorios
@@ -368,8 +493,8 @@ class Orchestrator:
             # 1) Guarda en la BD, pasando primero el customer_id
             cs = CalendarService()
             reminder_id = cs.create(
-                self.current_customer_id,  # <- customer_id
-                date,                      # <- fecha como string "YYYY-MM-DD HH:MM:SS"
+                self.current_customer_id,  
+                date,                     
                 title,
                 wa_msg_id
             )
@@ -407,12 +532,11 @@ class Orchestrator:
         # 1) Buscar el cliente
         target_msg_id = context_id or wa_msg_id
         if not target_msg_id:
-            return False        # no hay referencia válida
+            return False        
         customer = Customer.query.filter_by(phone=phone_id).first()
         if not customer:
             return False
 
-        # 2) Buscar el recordatorio cuyo wa_msg_id coincide con el botón “Cancelar”
         reminder = (
             Reminder.query
             .filter_by(customer_id=customer.id, wa_msg_id=target_msg_id)
@@ -421,20 +545,16 @@ class Orchestrator:
         if not reminder:
             return False
 
-        # 3) Eliminar de la base
         db.session.delete(reminder)
         db.session.commit()
         return True
-        
-    # ------------------------------------------------------------------
-    # Clima
     # ------------------------------------------------------------------
     def get_weather(self, city: str = "Montevideo", units: str = "metric") -> dict:
-            try:
-                return get_forecast(city, units=units)
-            except Exception:
-                current_app.logger.exception("[get_weather] error")
-                return {"error": "weather_unavailable"}
+        try:
+            return get_forecast(city, units=units)
+        except Exception:
+            current_app.logger.exception("[get_weather] error")
+            return {"error": "weather_unavailable"}
 
     # ------------------------------------------------------------------
     # Calendario: disponibilidad + agendado en GCal
@@ -447,8 +567,22 @@ class Orchestrator:
         """
         Reserva slot en el Calendar si está libre.
         """
-        current_app.logger.info("[APPOINTMENT] Attempting to schedule: date=%s, duration=%d, title=%s, user=%s",
-                    date, duration_minutes, title, self.current_phone)
+        current_app.logger.info("[TOOL] schedule_meeting: date=%s, duration=%d, user=%s",
+                    date, duration_minutes, self.current_phone)
+
+        # Estandarizar título con nombre desde DB (ignorar el 'title' libre)
+        db_name = None
+        try:
+            if self.current_customer_id:
+                cust = CustomerService.get(self.current_customer_id) or {}
+                db_name = cust.get("name")
+            if not db_name and self.current_phone:
+                c = Customer.query.filter_by(phone=self.current_phone).first()
+                db_name = getattr(c, "name", None)
+        except Exception:
+            db_name = None
+        customer_name = db_name or (self.current_name or "Usuario")
+        event_title = f"Reunión con {customer_name}"
         
         if not self.has_calendar:
             current_app.logger.error("[APPOINTMENT] Calendar service not initialized")
@@ -472,17 +606,17 @@ class Orchestrator:
 
             event_id = self.calendar_api.schedule_meeting(
                 start_dt_str=date,
-                title=title,
+                title=event_title,
                 duration_minutes=duration_minutes,
                 wa_id=wa_id_var,
                 calendar_id=calendar_id,
             )
-            current_app.logger.info(f"[schedule_meeting] Evento creado en calendar_id para wa_id={wa_id_var}, event_id={event_id}")
+            current_app.logger.info(f"[TOOL] schedule_meeting ok wa_id={wa_id_var} event_id={event_id}")
 
-            return {"event_id": event_id, "date": date, "title": title}
+            return {"event_id": event_id, "date": date, "title": event_title}
 
         except Exception as exc:
-            logging.exception("[schedule_meeting] error")
+            logging.exception("[TOOL] schedule_meeting error")
             return {"error": str(exc)}
         
     def check_availability(
@@ -518,7 +652,15 @@ class Orchestrator:
                 wa_id=wa_id,
                 calendar_id=calendar_id,
             )
-            return {"slots": slots}
+            out = {"slots": slots}
+            try:
+                current_app.logger.info(
+                    "[TOOL] check_availability OUTPUT=%s",
+                    json.dumps(out, ensure_ascii=False)
+                )
+            except Exception:
+                pass
+            return out
         except Exception as e:
             logging.exception("[check_availability] error")
             return {"error": "calendar_error", "message": str(e)}
@@ -526,9 +668,6 @@ class Orchestrator:
     # ------------------------------------------------------------------
     # 📅  Programar mensajes a terceros (sin APScheduler)
     # ------------------------------------------------------------------
-
-    import re 
-    
     @staticmethod
     def _to_e164_uy(phone: str) -> str:
         """
@@ -600,7 +739,6 @@ class Orchestrator:
             text=mensaje,
             send_dt=dt,
         )
-
 
     def cancel_scheduled_message(
                 self,
