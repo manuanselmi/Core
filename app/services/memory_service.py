@@ -51,7 +51,14 @@ class Memory:
         return ctx
 
     @staticmethod
-    def save_turn(phone: str, role: str, content: str, wa_msg_id: str | None = None) -> None:
+    def save_turn(phone: str, role: str, content: str, wa_msg_id: str | None = None) -> bool:
+        """
+        Guarda un turn en la DB con idempotencia por wa_msg_id.
+        
+        Returns:
+            True si se creó el turn (nuevo)
+            False si wa_msg_id ya existía (duplicado)
+        """
         convo = _get_convo(phone)
         try:
             db.session.add(Turn(conversation_id=convo.id,
@@ -60,9 +67,11 @@ class Memory:
                                 wa_msg_id=wa_msg_id))
             convo.updated_at = datetime.utcnow()
             db.session.commit()
+            return True  # Turn creado exitosamente
         except IntegrityError:
             db.session.rollback()
             current_app.logger.info("[Memory] wa_msg_id duplicado %s — ignorado", wa_msg_id)
+            return False  # Turn duplicado
 
     @staticmethod
     def should_summarize(phone: str) -> bool:

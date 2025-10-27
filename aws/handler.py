@@ -16,9 +16,10 @@ from sqlalchemy.pool import NullPool
 from app.models import db, Turn, Reminder, ScheduledMessage, Customer
 from app.utils.phone_utils import normalize_phone_e164
 from uuid import uuid4
-from app.services.openai_service import client as openai_client , get_or_create_conversation
+from app.services.openai_service import client as openai_client
 from app.services.orchestrator import Orchestrator
 from app.services import scheduler_service
+from app.services.memory_service import Memory
 from app.utils.whatsapp_utils import (
     get_text_message_input,
     get_recordatorio_template_input,
@@ -105,11 +106,6 @@ def _is_eventbridge(evt: dict) -> bool:
         or evt.get("detail-type") == "scheduled-job"
         or evt.get("agentMode") == "job"
    )
-
-def _msg_already_processed(wamid: str) -> bool:
-    if not wamid:
-        return False
-    return db.session.query(db.exists().where(Turn.wa_msg_id == wamid)).scalar()
 
 def _parse_http_meta(event):
     """Normaliza evento de API GW v2 / v1."""
@@ -295,22 +291,37 @@ def lambda_handler(event, context):
         )
         return {"statusCode": 200, "body": "stale"}
 
-    if _msg_already_processed(wamid):
+    # 2.2) IDEMPOTENCIA: Guardar turn ANTES de procesar (con user_msg vacío por ahora)
+    # Esto previene procesamiento duplicado en caso de doble entrega del webhook
+    turn_created = Memory.save_turn(
+        phone=wa_id,
+        role="user",
+        content="",  # Se actualizará después de extraer/transcribir
+        wa_msg_id=wamid
+    )
+    
+    if not turn_created:
         logging.info(
-            "[WEBHOOK] Mensaje ya procesado %s",
+            "[TURN_DUPLICATE] wa_msg_id=%s ya procesado; cortando flujo",
             wamid,
             extra={"correlation_id": correlation_id, "wa_id": wa_id}
         )
         return {"statusCode": 200, "body": "ok"}
+    
+    logging.info(
+        "[TURN_NEW] wa_msg_id=%s wa_id=%s",
+        wamid, wa_id,
+        extra={"correlation_id": correlation_id}
+    )
 
-    # 2.2) UX: marcar leído + typing (opcional delay leve)
+    # 2.3) UX: marcar leído + typing (opcional delay leve)
     try:
         indicate_typing(wamid, phone_number_id)
     except Exception:
         pass
     _simulate_typing_delay()
 
-    # 2.3) Gestión de botones
+    # 2.4) Gestión de botones
     if msg_type in ("button", "interactive", "list"):
         payload_lower, context_id = _extract_button_payload(msg_type, msg_obj)
         logging.info(
@@ -318,16 +329,35 @@ def lambda_handler(event, context):
             payload_lower, context_id,
             extra={"correlation_id": correlation_id, "wa_id": wa_id, "wamid": wamid}
         )
+        
+        # Actualizar contenido del turn con el payload del botón
+        try:
+            turn = Turn.query.filter_by(wa_msg_id=wamid).first()
+            if turn:
+                turn.content = f"[button:{payload_lower}]"
+                db.session.commit()
+        except Exception:
+            logging.exception("[TURN_UPDATE] Error actualizando turn de botón")
+        
         _handle_button_action(payload_lower, wa_id, context_id)
         return {"statusCode": 200, "body": "ok"}
 
-    # 2.4) Audio → transcribir (con tu helper) y usar como user_msg
+    # 2.5) Audio → transcribir (con tu helper) y usar como user_msg
     if msg_type == "audio":
         try:
             media_id = msg_obj["audio"]["id"]
             text = transcribe_audio(media_id)
             # Si es audio reenviado, sólo devolvemos la transcripción al usuario
             if msg_obj.get("context", {}).get("forwarded", False):
+                # Actualizar turn con la transcripción
+                try:
+                    turn = Turn.query.filter_by(wa_msg_id=wamid).first()
+                    if turn:
+                        turn.content = f"[audio_forwarded]: {text}"
+                        db.session.commit()
+                except Exception:
+                    logging.exception("[TURN_UPDATE] Error actualizando turn de audio")
+                
                 send_message(get_text_message_input(wa_id, text))
                 return {"statusCode": 200, "body": "ok"}
             user_msg = text
@@ -340,30 +370,24 @@ def lambda_handler(event, context):
     else:
         user_msg = msg_obj.get("text", {}).get("body", "").strip()
 
-    # 2.5) Asegurar/obtener thread activo (idempotente y sin carrera)
-    try:
-        conversation_id = get_or_create_conversation(
-            wa_id=wa_id,
-            customer_id=None,  # si lo resolvés antes, pasalo aquí
-            correlation_id=correlation_id,
-            last_wa_msg_id=wamid,
-        )
-        logging.info(
-            "[WEBHOOK] get_or_create_conversation OK",
-            extra={"correlation_id": correlation_id, "wa_id": wa_id, "wamid": wamid, "conversation_id": conversation_id},
-        )
-    except Exception:
-        # Hardening: no tiramos 5xx al webhook; log y seguimos (el orchestrator también reintenta)
-        logging.exception(
-            "[WEBHOOK] get_or_create_conversation falló (se continúa para no interrumpir el flujo)",
-            extra={"correlation_id": correlation_id, "wa_id": wa_id, "wamid": wamid},
-        )
-        conversation_id = None  # opcional: si no querés romper flujos posteriores
+    # 2.5b) Actualizar contenido del turn guardado (ahora que tenemos el texto real)
+    if user_msg:
+        try:
+            turn = Turn.query.filter_by(wa_msg_id=wamid).first()
+            if turn:
+                turn.content = user_msg
+                db.session.commit()
+        except Exception:
+            logging.exception(
+                "[TURN_UPDATE] Error actualizando contenido del turn",
+                extra={"correlation_id": correlation_id, "wa_id": wa_id, "wamid": wamid}
+            )
 
     # 2.6) Orchestrator → respuesta
+    # La idempotencia está garantizada por el guardado temprano del turn
     bot_reply = orchestrator.handle_message(user_msg or "", wa_id, name, wamid)
 
-    # 2.6) Construcción de payload de salida
+    # 2.7) Construcción de payload de salida
     payload = None
     if isinstance(bot_reply, dict) and "reminder_id" in bot_reply:
         title = bot_reply.get("title") or bot_reply.get("mensaje") or ""
@@ -388,7 +412,7 @@ def lambda_handler(event, context):
         logging.warning("[WEBHOOK] bot_reply tipo inesperado: %r", type(bot_reply))
         return {"statusCode": 200, "body": "ok"}
 
-    # 2.7) Enviar mensaje (y persistir wa_msg_id si era recordatorio)
+    # 2.8) Enviar mensaje (y persistir wa_msg_id si era recordatorio)
     if payload:
         try:
             resp = send_message(payload)

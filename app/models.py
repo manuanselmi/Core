@@ -49,7 +49,7 @@ class Turn(db.Model):
     id              = db.Column(db.Integer, primary_key=True, autoincrement=True)
     conversation_id = db.Column(db.Integer, db.ForeignKey("conversations.id"), nullable=False)
     role            = db.Column(db.String, nullable=False)  # "user" | "assistant"
-    content         = db.Column(db.Text,  nullable=False)
+    content         = db.Column(db.Text,  nullable=False, default="")  # Permitir vacío temporalmente
     created_at      = db.Column(db.DateTime, default=datetime.utcnow)
     wa_msg_id       = db.Column(db.String(200), nullable=True, unique=True, index=True)
 

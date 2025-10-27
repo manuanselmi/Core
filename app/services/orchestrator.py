@@ -7,12 +7,9 @@ from zoneinfo import ZoneInfo
 from openai import OpenAI, BadRequestError
 import dateparser
 from app.services.responses_service import (
-    get_or_create_conversation_id,
-    responses_create,
-    set_last_response_id,
-    reset_conversation_for_phone,
+    create_first_response,
+    continue_with_tool_output,
     build_function_call_output,
-    continue_with_function_outputs,
 )
 from pathlib import Path
 from functools import lru_cache
@@ -193,21 +190,15 @@ class Orchestrator:
         """
         Envía el mensaje a OpenAI Responses y devuelve el texto final.
         Si hay tool-calls, las ejecuta y encadena hasta obtener respuesta final.
+        
+        **SOLO RESPONSES API** - sin Conversations API.
+        Primera llamada con tools, continuaciones con previous_response_id.
         """
         # --- Contexto base ---
-        wa_phone = wa_id  # si tenes normalizador E.164, usalo acá
+        wa_phone = wa_id
         correlation_id = getattr(current_app, "correlation_id", None)
-        # Propagate WhatsApp message id for idempotency/metadata
-        wa_msg_id = wa_msg_id or os.getenv("CURRENT_WAMID") 
+        wa_msg_id = wa_msg_id or os.getenv("CURRENT_WAMID")
 
-        # Conversación (estado persistente tipo threads)
-        conv_id = get_or_create_conversation_id(
-            wa_phone,
-            customer_id=getattr(self, "current_customer_id", None),
-            correlation_id=correlation_id,
-            last_wa_msg_id=wa_msg_id
-        )
-        
         # Tools (de tu catálogo). Asegurate que esta función devuelva la lista (no el dict raíz)
         tools = self._load_tools_catalog()
         if isinstance(tools, dict) and "tools" in tools:
@@ -224,65 +215,51 @@ class Orchestrator:
         )
         instructions = base_instr + extra_instr
 
-        # --- 1) Primera llamada: el modelo puede pedir function_call(s) ---
-        # Idempotency key for first turn (deterministic per conv + wamid)
-        first_idem = f"resp:{conv_id}:{wa_msg_id or 'none'}:turn0"
+        # --- 1) Primera llamada: SOLO Responses API (sin conversation) ---
+        turn_index = 0
+        first_idem = f"resp::{wa_msg_id or 'none'}::turn{turn_index}"
+        
         # Feature flag to disable parallel tool calls for compatibility
         disable_parallel = os.getenv("DISABLE_PARALLEL_TOOL_CALLS", "true").lower() in ("1", "true", "yes")
         if disable_parallel:
             current_app.logger.info("[RESP] parallel_tool_calls disabled")
-        try:
-            resp = responses_create(
-                model=current_app.config["OPENAI_MODEL"],
-                instructions=instructions,
-                input_items=[{
-                    "role": "user",
-                    "content": [{"type": "input_text", "text": user_msg}]
-                }],
-                tools=tools,
-                conversation_id=conv_id,
-                stream=False,
-                tool_choice="auto",
-                store=True,
-                metadata={"wa_id": wa_phone, "wa_msg_id": wa_msg_id},
-                idempotency_key=first_idem,
-                parallel_tool_calls=False if disable_parallel else None,
-            )
-        except BadRequestError as e:
-            msg = str(e) or ""
-            if "No tool output found" in msg:
-                # Soft reset: create a fresh conversation without deleting the old one, then retry once
-                current_app.logger.warning(
-                    "[RESP] dirty conversation for %s (conv=%s). Soft-rotating and retrying once.",
-                    wa_phone, conv_id
-                )
-                conv_id = reset_conversation_for_phone(wa_phone, delete_remote=False)
-                first_idem = f"resp:{conv_id}:{wa_msg_id or 'none'}:turn0"
-                resp = responses_create(
-                    model=current_app.config["OPENAI_MODEL"],
-                    instructions=instructions,
-                    input_items=[{
-                        "role": "user",
-                        "content": [{"type": "input_text", "text": user_msg}]
-                    }],
-                    tools=tools,
-                    conversation_id=conv_id,
-                    stream=False,
-                    tool_choice="auto",
-                    store=True,
-                    metadata={"wa_id": wa_phone, "wa_msg_id": wa_msg_id},
-                    idempotency_key=first_idem,
-                    parallel_tool_calls=False if disable_parallel else None,
-                )
-            else:
-                raise
+        
+        # Initial input messages
+        input_messages = [{
+            "role": "user",
+            "content": [{"type": "input_text", "text": user_msg}]
+        }]
+        
+        current_app.logger.info(
+            "[ORCH] First response call - correlation_id=%s wa_id=%s wa_msg_id=%s",
+            correlation_id, wa_phone, wa_msg_id
+        )
+        
+        resp = create_first_response(
+            model=current_app.config["OPENAI_MODEL"],
+            instructions=instructions,
+            input_items=input_messages,
+            tools=tools,
+            tool_choice="auto",
+            store=True,
+            metadata={"wa_id": wa_phone, "wa_msg_id": wa_msg_id, "correlation_id": correlation_id},
+            idempotency_key=first_idem,
+            parallel_tool_calls=False if disable_parallel else None,
+        )
 
-        prev_id = getattr(resp, "id", None)
-        if prev_id:
-            set_last_response_id(wa_phone, prev_id)
+        first_response_id = getattr(resp, "id", None)
+        current_app.logger.info(
+            "[ORCH] First response.id=%s correlation_id=%s",
+            first_response_id, correlation_id
+        )
 
-        # --- 2) Loop: ejecutar tools y encadenar con previous_response_id ---
-        while True:
+        # --- 2) Loop: ejecutar tools y encadenar SOLO con previous_response_id ---
+        max_iterations = 10  # Safety limit
+        iteration = 0
+        
+        while iteration < max_iterations:
+            iteration += 1
+            
             # 1) Preferir la ruta oficial: required_action.submit_tool_outputs.tool_calls
             req_action = getattr(resp, "required_action", None)
             tool_calls = []
@@ -301,12 +278,12 @@ class Orchestrator:
                 for c in (tool_calls or [])
             ]
             current_app.logger.debug(
-                "[TOOL] detectadas=%d ids=%s",
-                len(tool_calls or []), ids_detectadas
+                "[TOOL] iter=%d detected=%d ids=%s",
+                iteration, len(tool_calls or []), ids_detectadas
             )
 
             if not tool_calls:
-                # Observabilidad adicional para depurar ausencias de tool-calls
+                # No hay más tools → tenemos respuesta final
                 try:
                     out_items = getattr(resp, "output", []) or []
                     msg_types = []
@@ -314,7 +291,7 @@ class Orchestrator:
                         t = getattr(it, "type", None)
                         if t == "message":
                             msg_types.extend([getattr(p, "type", None) for p in (getattr(it, "content", []) or [])])
-                    current_app.logger.warning(
+                    current_app.logger.debug(
                         "[RESP] no tool calls found. resp.id=%s out_types=%s message.part.types=%s",
                         getattr(resp, "id", None),
                         [getattr(i, "type", None) for i in out_items],
@@ -322,10 +299,11 @@ class Orchestrator:
                     )
                 except Exception:
                     pass
-                break  # no hay más tools → tenemos respuesta final
+                break
 
-            call_ids: list[str] = []
-            batched_results: list[dict] = []
+            # 3) Ejecutar cada tool-call y construir outputs
+            tool_outputs = []
+            
             for fc in tool_calls:
                 # Compatibilidad: estructura distinta según SDK
                 tool_name = getattr(fc, "name", None)
@@ -354,92 +332,85 @@ class Orchestrator:
                     or getattr(fc, "tool_call_id", None)
                 )
                 if not call_id:
-                    current_app.logger.warning("[TOOL] %s sin call_id; se omite para evitar inconsistencias", tool_name)
+                    current_app.logger.warning(
+                        "[TOOL] %s sin call_id; se omite para evitar inconsistencias", 
+                        tool_name
+                    )
                     continue
 
                 # Ejecutar servicio real (GCal/DB/etc.) con manejo de errores
                 try:
                     result = self._dispatch_tool(tool_name, tool_args)
-                    current_app.logger.info("[TOOL] %s ejecutada → result type=%s", tool_name, type(result).__name__)
+                    current_app.logger.info(
+                        "[TOOL] %s ejecutada → call_id=%s result_type=%s",
+                        tool_name, call_id, type(result).__name__
+                    )
                     if result is None:
-                        current_app.logger.warning("[TOOL] %s devolvió None, usando dict con error", tool_name)
-                        result = {"error": "tool_returned_none"}
+                        current_app.logger.warning(
+                            "[TOOL] %s devolvió None, usando dict vacío", 
+                            tool_name
+                        )
+                        result = {}
                 except Exception as e:
                     current_app.logger.exception("[TOOL] %s falló", tool_name)
                     result = {"ok": False, "error": str(e)}
 
-                call_ids.append(call_id)
-                # Serialize output as JSON string per Responses API contract
+                # CRÍTICO: Serialize output as JSON STRING per Responses API contract
                 out_str = json.dumps(result if result is not None else {}, ensure_ascii=False)
-                current_app.logger.info("[TOOL] %s → call_id=%s output_len=%d", tool_name, call_id, len(out_str))
-                batched_results.append({
-                    "tool_call_id": call_id,
-                    "output": out_str,
-                })
-
-            if not batched_results:
-                current_app.logger.warning("[CONT] no hubo outputs válidos para enviar; corto el loop para evitar bucles.")
-                break
-
-            # Construir function_call_output items (uno por cada tool-call)
-            fc_outputs: list[dict] = []
-            for br in batched_results:
-                fc_outputs.append(
-                    build_function_call_output(
-                        call_id=br.get("tool_call_id"),
-                        output_json_string=br.get("output", "{}"),
-                    )
+                current_app.logger.info(
+                    "[TOOL] %s → call_id=%s output_len=%d",
+                    tool_name, call_id, len(out_str)
+                )
+                
+                # Agregar function_call_output con call_id y JSON string
+                tool_outputs.append(
+                    build_function_call_output(call_id, out_str)
                 )
 
-            # Validación: no enviar parcial
-            if len(fc_outputs) != len(tool_calls):
-                current_app.logger.error(
-                    "[CONT] outputs=%d pero tool_calls=%d → no envío parcial; corto para evitar 400",
-                    len(fc_outputs), len(tool_calls)
+            # Validación: asegurar que agregamos outputs
+            if not tool_outputs:
+                current_app.logger.warning(
+                    "[CONT] no se generaron outputs válidos; corto el loop para evitar bucles."
                 )
                 break
 
-            # Enviar una sola continuación con todas las devoluciones de esta ronda
+            # 4) Enviar continuation con previous_response_id (SOLO previous_response_id)
+            turn_index += 1
+            follow_idem = f"resp::{wa_msg_id or 'none'}::follow::{first_response_id}::n{turn_index}"
+            
             current_app.logger.info(
-                "[CONT] sending prev_id=%s call_ids=%s count=%d",
-                prev_id, call_ids, len(fc_outputs)
+                "[CONT] sending continuation prev_id=%s turn=%d outputs=%d correlation_id=%s",
+                first_response_id, turn_index, len(tool_outputs), correlation_id
             )
-            # Log detallado de lo que vamos a enviar
-            for idx, br in enumerate(fc_outputs):
-                current_app.logger.debug(
-                    "[CONT] output %d: call_id=%s preview=%s",
-                    idx, br.get("call_id"), br.get("output", "")[:200]
-                )
-            # Deterministic idempotency key for this follow-up
-            follow_idem = f"resp:{conv_id}:{wa_msg_id or 'none'}:follow:{prev_id}"
-            current_app.logger.info(
-                "[CONT] returning %d outputs prev_id=%s ids=%s",
-                len(fc_outputs), prev_id, [o.get("call_id") for o in fc_outputs]
-            )
-            resp = continue_with_function_outputs(
-                model=current_app.config["OPENAI_MODEL"],
-                previous_response_id=prev_id,
-                outputs=fc_outputs,
+            
+            resp = continue_with_tool_output(
+                model=current_app.config["OPENAI_MODEL"],  # REQUIRED en continuación
+                previous_response_id=first_response_id,  # SIEMPRE el primer response.id del turno
+                input_items=tool_outputs,
+                store=True,
+                metadata={"wa_id": wa_phone, "wa_msg_id": wa_msg_id, "correlation_id": correlation_id},
                 idempotency_key=follow_idem,
-                tools=tools,
-                disable_parallel=disable_parallel,
-                timeout_s=17.0,
             )
+            
             current_app.logger.debug(
                 "[CONT] response.id=%s status=%s",
                 getattr(resp, "id", None), getattr(resp, "status", None),
             )
+            
             if not resp:
                 current_app.logger.error(
-                    "[CONT] continuation aborted due to invalid outputs; breaking to avoid loop."
+                    "[CONT] continuation failed; breaking to avoid loop."
                 )
                 break
-            prev_id = getattr(resp, "id", prev_id)
-            if prev_id:
-                set_last_response_id(wa_phone, prev_id)
 
         # --- 3) Texto final ---
         final_text = getattr(resp, "output_text", None) or self._render_text(getattr(resp, "output", []))
+        
+        current_app.logger.info(
+            "[ORCH] Final output length=%d correlation_id=%s first_response_id=%s",
+            len(final_text or ""), correlation_id, first_response_id
+        )
+        
         return final_text
 
     def _dispatch_tool(self, tool_name: str, tool_args: dict) -> dict | None:
