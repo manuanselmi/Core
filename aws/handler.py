@@ -16,7 +16,7 @@ from sqlalchemy.pool import NullPool
 from app.models import db, Turn, Reminder, ScheduledMessage, Customer
 from app.utils.phone_utils import normalize_phone_e164
 from uuid import uuid4
-from app.services.openai_service import client as openai_client
+from app.services.openai_client import client as openai_client
 from app.services.orchestrator import Orchestrator
 from app.services import scheduler_service
 from app.services.memory_service import Memory

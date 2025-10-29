@@ -107,6 +107,39 @@
     },
     {
       "type": "function",
+      "name": "cancelar",
+      "description": "Cancela una cita del cliente, elimina el evento de Google Calendar y su recordatorio asociado.",
+      "parameters": {
+        "type": "object",
+        "properties": {
+          "appointment_id": {
+            "type": "integer",
+            "description": "ID interno de la cita a cancelar (appointment_id)."
+          },
+          "google_event_id": {
+            "type": "string",
+            "description": "ID del evento en Google Calendar (alternativa a appointment_id)."
+          },
+          "cancel_reason": {
+            "type": "string",
+            "description": "Motivo opcional de la cancelación."
+          }
+        },
+        "additionalProperties": false
+      }
+    },
+    {
+      "type": "function",
+      "name": "list_upcoming_appointments",
+      "description": "Lista las próximas citas agendadas del cliente (status='scheduled' y fecha futura).",
+      "parameters": {
+        "type": "object",
+        "properties": {},
+        "additionalProperties": false
+      }
+    },
+    {
+      "type": "function",
       "name": "enviar_mensaje",
       "description": "Envía o programa un mensaje de WhatsApp a un número específico. Puede ser inmediato o programado.",
       "parameters": {

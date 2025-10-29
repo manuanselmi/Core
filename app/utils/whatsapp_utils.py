@@ -10,7 +10,7 @@ from flask import current_app as app
 from app.services.bot_logic import BotLogic
 from app.models import db, Reminder
 import tempfile
-from app.services.openai_service import client as openai_client
+from app.services.openai_client import client as openai_client
 
 # Inicializar la lógica de fecha
 g_logic = BotLogic()

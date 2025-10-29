@@ -8,7 +8,7 @@ from sqlalchemy import select, update
 
 from app.models import db, AssistantThread
 from app.utils.phone_utils import normalize_phone_e164
-from app.services.openai_service import client as openai_client
+from app.services.openai_client import client as openai_client
 
 def get_active_thread_id(wa_phone_raw: str) -> Optional[str]:
     wa_phone = normalize_phone_e164(wa_phone_raw)

@@ -194,10 +194,14 @@ def _claim_due_reminders(sess: Session, now_local: datetime, limit: int) -> list
     """
     Selecciona recordatorios vencidos. Usamos SKIP LOCKED via select+delete por ítem.
     Si tu tabla crece, agregá índice por `date`.
+    NOTA: Los reminders vinculados a appointments (appointment_id NOT NULL) se manejan
+    vía _claim_due_appointments; aquí solo procesamos reminders standalone.
     """
+    from app.models import Reminder
     q = (
         select(Reminder)
         .join(Customer)
+        .filter(Reminder.appointment_id.is_(None))  # Solo reminders NO vinculados a appointments
         .order_by(Reminder.date.asc())
         .limit(limit)
         .with_for_update(skip_locked=True)
@@ -229,6 +233,98 @@ def _process_reminders(sess: Session, rows: list[Reminder]) -> int:
     return sent
 
 
+def _claim_due_appointments(sess: Session, now_utc: datetime, limit: int) -> list:
+    """
+    Selecciona appointments con recordatorio pendiente (status='scheduled' AND reminder_status='pending' AND remind_at <= now).
+    Usa SKIP LOCKED para evitar procesamiento duplicado.
+    """
+    from app.models import Appointment
+    q = (
+        select(Appointment)
+        .filter(
+            Appointment.status == 'scheduled',
+            Appointment.reminder_status == 'pending',
+            Appointment.remind_at <= now_utc
+        )
+        .order_by(Appointment.remind_at.asc())
+        .limit(limit)
+        .with_for_update(skip_locked=True)
+    )
+    rows = sess.execute(q).scalars().all()
+    return rows
+
+
+def _process_appointments(sess: Session, rows: list, now_utc: datetime) -> tuple[int, int, int]:
+    """
+    Procesa appointments para enviar recordatorios.
+    Valida existencia del evento en Google Calendar antes de enviar.
+    Retorna (sent, skipped, canceled_detected).
+    """
+    from app.models import Appointment, Customer
+    from app.services.google_calendar_service import GoogleCalendarService
+    from app.config.settings import SETTINGS
+    
+    sent = 0
+    skipped = 0
+    canceled_detected = 0
+    
+    try:
+        gcal = GoogleCalendarService()
+    except Exception:
+        logging.warning("[SchedulerService] Google Calendar no disponible para validar eventos")
+        gcal = None
+    
+    for appt in rows:
+        try:
+            # Validar existencia del evento en Google Calendar
+            if gcal and appt.google_event_id:
+                event = gcal.get_event(appt.google_event_id, appt.google_calendar_id)
+                if not event or event.get("status") == "cancelled":
+                    # Evento no existe o fue cancelado externamente
+                    logging.info(
+                        "[SchedulerService] Evento cancelado/inexistente en Google: appt_id=%s, event_id=%s",
+                        appt.id, appt.google_event_id
+                    )
+                    appt.status = 'canceled'
+                    appt.reminder_status = 'skipped'
+                    appt.cancel_reason = "Cancelado externamente (detectado al enviar recordatorio)"
+                    canceled_detected += 1
+                    continue
+            
+            # Obtener customer
+            customer = sess.get(Customer, appt.customer_id)
+            if not customer or not customer.phone:
+                logging.warning("[SchedulerService] Customer no encontrado o sin teléfono: appt_id=%s", appt.id)
+                appt.reminder_status = 'error'
+                continue
+            
+            # Construir mensaje de recordatorio
+            agent_name = SETTINGS.AGENT_NAME
+            titulo = f"Tenés turno con {agent_name} en una hora."
+            if appt.title:
+                titulo = f"Recordatorio: {appt.title}"
+            
+            # Enviar recordatorio
+            payload = get_event_reminder_template_input(
+                recipient=customer.phone,
+                titulo=titulo
+            )
+            send_message(payload)
+            
+            # Marcar como enviado
+            appt.reminder_status = 'sent'
+            appt.last_reminder_sent_at = now_utc
+            sent += 1
+            logging.info("[SchedulerService] Recordatorio enviado: appt_id=%s, customer=%s", 
+                        appt.id, customer.phone)
+            
+        except Exception:
+            logging.exception("[SchedulerService] Error procesando Appointment id=%s", appt.id)
+            appt.reminder_status = 'error'
+    
+    return (sent, skipped, canceled_detected)
+
+
 # ────────────────────────────────────────────────────────────────────
 # Entry point ejecutado por EventBridge
 # ────────────────────────────────────────────────────────────────────
@@ -251,15 +347,28 @@ def run_due_jobs() -> dict:
         with db.session.begin():
             sent_msgs = _process_scheduled_messages(db.session, rows_sm, now_utc)
 
-        # 2) Reminders
+        # 2) Appointments (recordatorios de citas)
+        with db.session.begin():
+            rows_appt = _claim_due_appointments(db.session, now_utc, BATCH_LIMIT)
+        with db.session.begin():
+            sent_appt, skipped_appt, canceled_appt = _process_appointments(db.session, rows_appt, now_utc)
+
+        # 3) Reminders (standalone, no vinculados a appointments)
         with db.session.begin():
             rows_rem = _claim_due_reminders(db.session, now_local, BATCH_LIMIT)
             sent_rem = _process_reminders(db.session, rows_rem)
 
     if app:
         app.logger.info(
-            "[SchedulerService] run_due_jobs: scheduled_sent=%s, reminders_sent=%s",
-            sent_msgs, sent_rem,
+            "[SchedulerService] run_due_jobs: scheduled_sent=%s, appointments_sent=%s, appointments_skipped=%s, appointments_canceled_detected=%s, reminders_sent=%s",
+            sent_msgs, sent_appt, skipped_appt, canceled_appt, sent_rem,
         )
 
-    return {"ok": True, "scheduled_sent": sent_msgs, "reminders_sent": sent_rem}
+    return {
+        "ok": True,
+        "scheduled_sent": sent_msgs,
+        "appointments_sent": sent_appt,
+        "appointments_skipped": skipped_appt,
+        "appointments_canceled_detected": canceled_appt,
+        "reminders_sent": sent_rem
+    }

@@ -215,8 +215,8 @@ class GoogleCalendarService:
         description: str = "",
         wa_id: str | None = None,
         calendar_id: str | None = None,
-    ) -> str:
-        """Crea un evento y notifica por WhatsApp a Lucas. Devuelve el `eventId`."""
+    ) -> dict:
+        """Crea un evento y notifica por WhatsApp a Lucas. Devuelve dict con event_id, calendar_id, start_dt, end_dt, meet_link."""
         current_app.logger.info("[APPOINTMENT] Scheduling meeting: start=%s, title=%s, duration=%d minutes, user=%s",
                       start_dt_str, title, duration_minutes, wa_id)
         
@@ -250,11 +250,55 @@ class GoogleCalendarService:
         # WhatsApp a Lucas (si está configurado)
         if LUCAS_WAID and _norm_waid(wa_id) != "59893944122":
             from app.utils.whatsapp_utils import send_message, get_text_message_input
-            text = f"📅 Nueva reunión: “{title}” — {start_dt.strftime('%d/%m/%Y %H:%M')} - si queres contactarte con la persona, aquí está su número: {wa_id}"
+            text = f"📅 Nueva reunión: \"{title}\" — {start_dt.strftime('%d/%m/%Y %H:%M')} - si queres contactarte con la persona, aquí está su número: {wa_id}"
             try:
                 send_message(get_text_message_input(LUCAS_WAID, text))
                 current_app.logger.info("[APPOINTMENT] WhatsApp notification sent to admin: %s", text)
             except Exception:
                 current_app.logger.exception("[APPOINTMENT] Failed to send WhatsApp notification to admin")
 
-        return event["id"]
+        return {
+            "event_id": event["id"],
+            "calendar_id": cal_id,
+            "start_dt": start_dt.isoformat(),
+            "end_dt": end_dt.isoformat(),
+            "meet_link": event.get("hangoutLink") or event.get("conferenceData", {}).get("entryPoints", [{}])[0].get("uri")
+        }
+    
+    # ---------- Cancelación de evento ----------
+    def cancel_event(self, event_id: str, calendar_id: str | None = None) -> bool:
+        """Cancela un evento en Google Calendar. Retorna True si se canceló, False si no existe."""
+        if not self.service:
+            _logger().error("[GoogleCalendarService] No hay servicio de calendario inicializado")
+            return False
+        
+        cal_id = calendar_id or CALENDAR_ID
+        try:
+            self.service.events().delete(calendarId=cal_id, eventId=event_id).execute()
+            _logger().info("[GoogleCalendarService] Evento cancelado: event_id=%s, calendar=%s", event_id, cal_id)
+            return True
+        except Exception as e:
+            if "404" in str(e) or "not found" in str(e).lower():
+                _logger().warning("[GoogleCalendarService] Evento no encontrado (ya cancelado?): event_id=%s", event_id)
+                return False
+            _logger().exception("[GoogleCalendarService] Error cancelando evento: event_id=%s", event_id)
+            raise
+    
+    # ---------- Obtención de evento ----------
+    def get_event(self, event_id: str, calendar_id: str | None = None) -> dict | None:
+        """Obtiene un evento de Google Calendar. Retorna dict o None si no existe."""
+        if not self.service:
+            _logger().error("[GoogleCalendarService] No hay servicio de calendario inicializado")
+            return None
+        
+        cal_id = calendar_id or CALENDAR_ID
+        try:
+            event = self.service.events().get(calendarId=cal_id, eventId=event_id).execute()
+            return event
+        except Exception as e:
+            if "404" in str(e) or "not found" in str(e).lower():
+                _logger().warning("[GoogleCalendarService] Evento no encontrado: event_id=%s", event_id)
+                return None
+            _logger().exception("[GoogleCalendarService] Error obteniendo evento: event_id=%s", event_id)
+            return None
+

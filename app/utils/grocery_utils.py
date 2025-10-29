@@ -1,5 +1,5 @@
 from typing import List
-from app.services.openai_service import client as openai_client
+from app.services.openai_client import client as openai_client
 
 SYS_PROMPT = (
     "Eres un asistente que recibe la transcripción literal de un audio. "

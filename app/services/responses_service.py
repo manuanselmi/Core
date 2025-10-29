@@ -85,25 +85,32 @@ def continue_with_tool_output(
     model: str,
     previous_response_id: str,
     input_items: List[Dict[str, Any]],
+    instructions: Optional[str] = None,
+    tools: Optional[List[Dict[str, Any]]] = None,
+    tool_choice: str = "auto",
     store: bool = True,
     metadata: Optional[Dict[str, Any]] = None,
     idempotency_key: Optional[str] = None,
     timeout_s: float = 17.0,
+    parallel_tool_calls: Optional[bool] = None,
 ):
     """
     Continue a turn by providing function_call_output using previous_response_id.
     
-    CRITICAL: Continuations MUST include 'model' parameter.
-    CRITICAL: Do NOT include 'tools', 'tool_choice', 'instructions', 'parallel_tool_calls' in continuations.
+    MODIFIED: Now includes tools and instructions in ALL calls as requested.
     
     Args:
-        model: OpenAI model name (REQUIRED even in continuations)
+        model: OpenAI model name (REQUIRED)
         previous_response_id: The response.id from the first response in this turn
         input_items: List containing function_call_output items
+        instructions: System instructions (now passed in continuations too)
+        tools: List of available tools (now passed in continuations too)
+        tool_choice: Tool choice strategy
         store: Whether to store the response
         metadata: Additional metadata
         idempotency_key: Key for idempotent requests
         timeout_s: Request timeout in seconds
+        parallel_tool_calls: Whether to enable parallel tool calls
         
     Returns:
         Response object from OpenAI Responses API
@@ -114,6 +121,17 @@ def continue_with_tool_output(
         "input": input_items,
         "store": store,
     }
+    
+    # Always include instructions and tools if provided
+    if instructions is not None:
+        kwargs["instructions"] = instructions
+    
+    if tools is not None:
+        kwargs["tools"] = tools
+        kwargs["tool_choice"] = tool_choice
+    
+    if parallel_tool_calls is not None:
+        kwargs["parallel_tool_calls"] = parallel_tool_calls
     
     if metadata is not None:
         kwargs["metadata"] = metadata
@@ -128,10 +146,11 @@ def continue_with_tool_output(
         log_kwargs["input"] = f"[{len(log_kwargs['input'])} items]"
     
     logger.info(
-        "[RESP] continue_with_tool_output: model=%s prev_id=%s items=%d idem=%s",
+        "[RESP] continue_with_tool_output: model=%s prev_id=%s items=%d tools=%s idem=%s",
         model,
         previous_response_id,
         len(input_items),
+        "yes" if tools else "no",
         idempotency_key,
     )
 

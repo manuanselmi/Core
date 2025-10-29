@@ -14,6 +14,8 @@ class _Settings:
     TZ: str
     DEBUG: bool
     OPENAI_MODEL: str
+    AGENT_NAME: str
+    EVENT_ADVANCE_MINUTES: int
 
 def load_settings() -> _Settings:
     return _Settings(
@@ -27,7 +29,9 @@ def load_settings() -> _Settings:
         GRAPH_API_VERSION=os.getenv("GRAPH_API_VERSION", "23.0"),
         TZ=os.getenv("TZ", "America/Montevideo"),
         DEBUG=(os.getenv("DEBUG", "false").lower() == "true"),
-        OPENAI_MODEL=os.getenv("OPENAI_MODEL", "gpt-3.5-turbo")
+        OPENAI_MODEL=os.getenv("OPENAI_MODEL", "gpt-3.5-turbo"),
+        AGENT_NAME=os.getenv("AGENT_NAME", "Karina"),
+        EVENT_ADVANCE_MINUTES=int(os.getenv("EVENT_ADVANCE_MINUTES", "60"))
     )
 
 SETTINGS = load_settings()
