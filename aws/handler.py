@@ -11,11 +11,10 @@ sys.stderr = io.TextIOWrapper(sys.stderr.buffer, encoding="utf-8")
 # ── Deps app ───────────────────────────────────────────────────
 import requests
 from flask import Flask
-from sqlalchemy.pool import NullPool
 
-from app.models import db, Turn, Reminder, ScheduledMessage, Customer
 from app.utils.phone_utils import normalize_phone_e164
 from uuid import uuid4
+from app.db import RepositoryProvider
 from app.services.openai_client import client as openai_client
 from app.services.orchestrator import Orchestrator
 from app.services import scheduler_service
@@ -36,26 +35,6 @@ from app.config.settings import SETTINGS
 for key, value in SETTINGS.__dict__.items():
     APP.config[key] = value
 
-# DB_URL: corrige el "or" mal puesto (Render / Supabase)
-DB_URL = (
-    os.getenv("DATABASE_URL")
-    or os.getenv("SUPABASE_DB_URL")
-    or os.getenv("SUPABASE_URL")
-)
-if not DB_URL:
-    raise RuntimeError("Falta DATABASE_URL / SUPABASE_DB_URL en variables/env/secrets.")
-
-# Normaliza el dialecto para SQLAlchemy + psycopg (v3) eliminar a futuro, duplicado con el secrets loader
-if DB_URL.startswith("postgres://"):
-    DB_URL = "postgresql+psycopg://" + DB_URL[len("postgres://"):]
-else:
-    DB_URL = DB_URL.replace("postgresql://", "postgresql+psycopg://", 1)
-
-APP.config["SQLALCHEMY_DATABASE_URI"] = DB_URL
-APP.config["SQLALCHEMY_TRACK_MODIFICATIONS"] = False
-# Lambda + Render: evitar pools persistentes
-APP.config["SQLALCHEMY_ENGINE_OPTIONS"] = {"poolclass": NullPool}
-
 # Config WhatsApp / Tokens
 APP.config["GRAPH_API_VERSION"] = os.getenv("GRAPH_API_VERSION", "v23.0").lstrip("v")
 APP.config["PHONE_NUMBER_ID"]   = os.getenv("PHONE_NUMBER_ID")
@@ -66,28 +45,39 @@ LOCAL_TZ                        = os.getenv("TZ", "America/Montevideo")
 if not APP.config["PHONE_NUMBER_ID"] or not APP.config["ACCESS_TOKEN"]:
     raise RuntimeError("Faltan PHONE_NUMBER_ID y/o WHATSAPP_ACCESS_TOKEN.")
 
-db.init_app(APP)
-APP.app_context().push()
-
+# Inicializar scheduler (no requiere DB SQL)
 scheduler_service.init_scheduler(APP)
 
-logging.getLogger().setLevel(logging.DEBUG)
-# Configurar loggers específicos
+# Configuración de logging: solo INFO para app, ERROR para librerías
+logging.getLogger().setLevel(logging.INFO)
+
+# Silenciar logs verbosos de librerías externas
+logging.getLogger('botocore').setLevel(logging.ERROR)
+logging.getLogger('boto3').setLevel(logging.ERROR)
+logging.getLogger('urllib3').setLevel(logging.ERROR)
+logging.getLogger('httpx').setLevel(logging.ERROR)
+logging.getLogger('httpcore').setLevel(logging.ERROR)
+logging.getLogger('openai').setLevel(logging.WARNING)
+logging.getLogger('googleapiclient').setLevel(logging.ERROR)
+logging.getLogger('google').setLevel(logging.ERROR)
+
+# Configurar loggers de la app en INFO
 for logger_name in ['GoogleCalendarService', 'Orchestrator', '__main__']:
     logger = logging.getLogger(logger_name)
-    logger.setLevel(logging.DEBUG)
-    # Asegurar que el logger tiene un handler
+    logger.setLevel(logging.INFO)
     if not logger.handlers:
         handler = logging.StreamHandler()
-        handler.setLevel(logging.DEBUG)
+        handler.setLevel(logging.INFO)
         formatter = logging.Formatter('%(asctime)s - %(name)s - %(levelname)s - %(message)s')
         handler.setFormatter(formatter)
         logger.addHandler(handler)
 
 logger = logging.getLogger(__name__)
 
-# Orchestrator intacto
-orchestrator = Orchestrator(openai_client, db_session=db.session)
+# Orchestrator global (será reinicializado con repo_provider en cada request)
+# Por ahora creamos una instancia por defecto
+default_repo_provider = RepositoryProvider()
+orchestrator = Orchestrator(openai_client, repo_provider=default_repo_provider)
 
 # Constantes/params
 STALE_MINUTES = int(os.getenv("WEBHOOK_STALE_MINUTES", "3"))
@@ -106,6 +96,84 @@ def _is_eventbridge(evt: dict) -> bool:
         or evt.get("detail-type") == "scheduled-job"
         or evt.get("agentMode") == "job"
    )
+
+def _handle_scheduler_jobs(repo_provider: RepositoryProvider, correlation_id: str) -> dict:
+    """
+    Procesa jobs programados: mensajes pendientes y recordatorios de citas.
+    Branch exclusivo para EventBridge cuando USE_DYNAMO=1.
+    """
+    from app.utils.whatsapp_utils import get_text_message_input, get_event_reminder_template_input
+    
+    logger.info("[CID=%s] [SCHEDULER] Processing jobs", correlation_id)
+    now_ms = int(time.time() * 1000)
+    
+    sent_messages = 0
+    sent_reminders = 0
+    
+    # 1) Procesar mensajes programados
+    try:
+        candidates = repo_provider.scheduled_messages.claim_pending_batch(now_ms, n=25)
+        
+        for msg in candidates:
+            try:
+                target_phone = msg.get("target_phone")
+                text = msg.get("text")
+                pk = msg.get("pk")
+                sk = msg.get("sk")
+                
+                payload = get_text_message_input(target_phone, text)
+                resp = send_message(payload)
+                wa_msg_id = resp.get("messages", [{}])[0].get("id")
+                
+                repo_provider.scheduled_messages.mark_sent(pk, sk, wa_msg_id=wa_msg_id, at_ms=now_ms)
+                sent_messages += 1
+            except Exception:
+                logger.exception("[CID=%s] [SCHEDULER] Error sending scheduled message", correlation_id)
+    except Exception:
+        logger.exception("[CID=%s] [SCHEDULER] Error claiming scheduled messages", correlation_id)
+    
+    # 2) Procesar recordatorios de citas
+    try:
+        reminders = repo_provider.appointments.query_reminders_due(now_ms)
+        
+        for appt in reminders:
+            try:
+                phone = appt.get("phone")
+                title = appt.get("title")
+                starts_at_ms = appt.get("starts_at_ms")
+                
+                # Formatear fecha/hora
+                starts_dt = datetime.fromtimestamp(starts_at_ms / 1000, tz=timezone.utc)
+                starts_local = starts_dt.astimezone(APP.config.get("TZ") or timezone.utc)
+                
+                payload = get_event_reminder_template_input(
+                    recipient=phone,
+                    titulo=title,
+                )
+                send_message(payload)
+                sent_reminders += 1
+                
+                # Marcar como enviado (update reminder_status)
+                pk = appt.get("pk")
+                sk = appt.get("sk")
+                repo_provider.appointments.update_reminder_status(pk, sk, "sent")
+            except Exception:
+                logger.exception("[CID=%s] [SCHEDULER] Error sending appointment reminder", correlation_id)
+    except Exception:
+        logger.exception("[CID=%s] [SCHEDULER] Error querying appointment reminders", correlation_id)
+    
+    result = {
+        "scheduled_messages_sent": sent_messages,
+        "appointment_reminders_sent": sent_reminders,
+        "timestamp": now_ms,
+    }
+    
+    logger.info("[CID=%s] [SCHEDULER] Completed: %d messages, %d reminders", correlation_id, sent_messages, sent_reminders)
+    return {
+        "statusCode": 200,
+        "headers": {"content-type": "application/json"},
+        "body": json.dumps(result, ensure_ascii=False)
+    }
 
 def _parse_http_meta(event):
     """Normaliza evento de API GW v2 / v1."""
@@ -184,7 +252,6 @@ def _handle_button_action(payload_lower: str, wa_id: str, context_id: str):
     """
     # 1) Cancelar recordatorio
     if payload_lower == "cancelar":
-        logging.info("🔕 Solicitud de cancelar recordatorio (ctx=%s)", context_id)
         try:
             cancelled = orchestrator.cancel_reminder(phone_id=wa_id, context_id=context_id)
         except Exception:
@@ -197,7 +264,6 @@ def _handle_button_action(payload_lower: str, wa_id: str, context_id: str):
 
     # 2) Cancelar mensaje programado
     if payload_lower == "no enviar":
-        logging.info("🛑 Solicitud de cancelar mensaje programado (ctx=%s)", context_id)
         try:
             cancelled = orchestrator.cancel_scheduled_message(phone_id=wa_id, context_id=context_id)
         except Exception:
@@ -207,9 +273,6 @@ def _handle_button_action(payload_lower: str, wa_id: str, context_id: str):
         txt = "Listo, tu mensaje programado no se enviará ❌." if cancelled else "⚠️ No había ningún mensaje pendiente."
         send_message(get_text_message_input(wa_id, txt))
         return
-
-    # Otros botones se ignoran
-    logging.info("[buttons] payload no mapeado: %r", payload_lower)
 
 def _extract_value(data: dict) -> tuple[dict, dict, dict] | None:
     """
@@ -237,195 +300,188 @@ def lambda_handler(event, context):
         or headers.get("x-amzn-trace-id")
         or str(uuid4())
     )
-
-    # 0) Invocación de EventBridge → correr jobs pendientes
-    if _is_eventbridge(event):
-        out = scheduler_service.run_due_jobs()
-        return {
-            "statusCode": 200,
-            "headers": {"content-type": "application/json"},
-            "body": json.dumps(out, ensure_ascii=False)
-        }
-
-    method, path, qs, raw_body = _parse_http_meta(event)
-
-    # 1) GET /webhook → verificación (Meta)
-    if method == "GET":
-        if (qs.get("hub.verify_token") == VERIFY_TOKEN) and qs.get("hub.challenge"):
-            return {"statusCode": 200, "body": qs["hub.challenge"]}
-        return {"statusCode": 403, "body": "Invalid verify token"}
-
-    # 2) POST /webhook
-    try:
-        body = json.loads(raw_body or "{}")
-    except Exception:
-        logging.exception("[WEBHOOK] body inválido", extra={"correlation_id": correlation_id})
-        return {"statusCode": 200, "body": "ok"}
-
-    result = _extract_value(body)
-    if not result:
-        logging.info(
-            "[WEBHOOK] Callback sin contacts/messages (statuses u otros)",
-            extra={"correlation_id": correlation_id}
-        )
-        return {"statusCode": 200, "body": "ok"}
-
-    value, contact, msg_obj = result
-    msg_type = msg_obj.get("type", "")
-    wa_id    = contact.get("wa_id")
-    name     = contact.get("profile", {}).get("name", "Desconocido")
-    phone_number_id = value["metadata"]["phone_number_id"]
-    wamid    = msg_obj.get("id")
-
-    # 2.1) Freshness + idempotencia
-    try:
-        ts_utc = datetime.fromtimestamp(int(msg_obj.get("timestamp", "0")), tz=timezone.utc)
-    except Exception:
-        ts_utc = datetime.now(timezone.utc)
-
-    if datetime.now(timezone.utc) - ts_utc > timedelta(minutes=STALE_MINUTES):
-        logging.info(
-            "[WEBHOOK] Mensaje %s ignorado por antigüedad (%s UTC)",
-            wamid, ts_utc.isoformat(timespec='seconds'),
-            extra={"correlation_id": correlation_id, "wa_id": wa_id}
-        )
-        return {"statusCode": 200, "body": "stale"}
-
-    # 2.2) IDEMPOTENCIA: Guardar turn ANTES de procesar (con user_msg vacío por ahora)
-    # Esto previene procesamiento duplicado en caso de doble entrega del webhook
-    turn_created = Memory.save_turn(
-        phone=wa_id,
-        role="user",
-        content="",  # Se actualizará después de extraer/transcribir
-        wa_msg_id=wamid
-    )
     
-    if not turn_created:
-        logging.info(
-            "[TURN_DUPLICATE] wa_msg_id=%s ya procesado; cortando flujo",
-            wamid,
-            extra={"correlation_id": correlation_id, "wa_id": wa_id}
-        )
-        return {"statusCode": 200, "body": "ok"}
-    
-    logging.info(
-        "[TURN_NEW] wa_msg_id=%s wa_id=%s",
-        wamid, wa_id,
-        extra={"correlation_id": correlation_id}
-    )
-
-    # 2.3) UX: marcar leído + typing (opcional delay leve)
-    try:
-        indicate_typing(wamid, phone_number_id)
-    except Exception:
-        pass
-    _simulate_typing_delay()
-
-    # 2.4) Gestión de botones
-    if msg_type in ("button", "interactive", "list"):
-        payload_lower, context_id = _extract_button_payload(msg_type, msg_obj)
-        logging.info(
-            "🔘 Button payload = %r (ctx=%s)",
-            payload_lower, context_id,
-            extra={"correlation_id": correlation_id, "wa_id": wa_id, "wamid": wamid}
-        )
+    # Inicializar app context con correlation_id
+    with APP.app_context():
+        APP.correlation_id = correlation_id
         
-        # Actualizar contenido del turn con el payload del botón
         try:
-            turn = Turn.query.filter_by(wa_msg_id=wamid).first()
-            if turn:
-                turn.content = f"[button:{payload_lower}]"
-                db.session.commit()
-        except Exception:
-            logging.exception("[TURN_UPDATE] Error actualizando turn de botón")
-        
-        _handle_button_action(payload_lower, wa_id, context_id)
-        return {"statusCode": 200, "body": "ok"}
+            # Crear repo_provider con correlation_id
+            repo_provider = RepositoryProvider(correlation_id_provider=lambda: correlation_id)
 
-    # 2.5) Audio → transcribir (con tu helper) y usar como user_msg
-    if msg_type == "audio":
-        try:
-            media_id = msg_obj["audio"]["id"]
-            text = transcribe_audio(media_id)
-            # Si es audio reenviado, sólo devolvemos la transcripción al usuario
-            if msg_obj.get("context", {}).get("forwarded", False):
-                # Actualizar turn con la transcripción
-                try:
-                    turn = Turn.query.filter_by(wa_msg_id=wamid).first()
-                    if turn:
-                        turn.content = f"[audio_forwarded]: {text}"
-                        db.session.commit()
-                except Exception:
-                    logging.exception("[TURN_UPDATE] Error actualizando turn de audio")
-                
-                send_message(get_text_message_input(wa_id, text))
+            # 0) Invocación de EventBridge → correr jobs pendientes
+            if _is_eventbridge(event):
+                return _handle_scheduler_jobs(repo_provider, correlation_id)
+
+            method, path, qs, raw_body = _parse_http_meta(event)
+
+            # 1) GET /webhook → verificación (Meta)
+            if method == "GET":
+                if (qs.get("hub.verify_token") == VERIFY_TOKEN) and qs.get("hub.challenge"):
+                    return {"statusCode": 200, "body": qs["hub.challenge"]}
+                return {"statusCode": 403, "body": "Invalid verify token"}
+
+            # 2) POST /webhook
+            try:
+                body = json.loads(raw_body or "{}")
+            except Exception:
+                logging.exception("[WEBHOOK] body inválido", extra={"correlation_id": correlation_id})
                 return {"statusCode": 200, "body": "ok"}
-            user_msg = text
-        except Exception:
-            logging.exception(
-                "[audio] fallo transcripción; se sigue con cadena vacía",
-                extra={"correlation_id": correlation_id, "wa_id": wa_id, "wamid": wamid}
-            )
-            user_msg = ""
-    else:
-        user_msg = msg_obj.get("text", {}).get("body", "").strip()
 
-    # 2.5b) Actualizar contenido del turn guardado (ahora que tenemos el texto real)
-    if user_msg:
-        try:
-            turn = Turn.query.filter_by(wa_msg_id=wamid).first()
-            if turn:
-                turn.content = user_msg
-                db.session.commit()
-        except Exception:
-            logging.exception(
-                "[TURN_UPDATE] Error actualizando contenido del turn",
-                extra={"correlation_id": correlation_id, "wa_id": wa_id, "wamid": wamid}
-            )
+            result = _extract_value(body)
+            if not result:
+                logging.info(
+                    "[WEBHOOK] Callback sin contacts/messages (statuses u otros)",
+                    extra={"correlation_id": correlation_id}
+                )
+                return {"statusCode": 200, "body": "ok"}
 
-    # 2.6) Orchestrator → respuesta
-    # La idempotencia está garantizada por el guardado temprano del turn
-    bot_reply = orchestrator.handle_message(user_msg or "", wa_id, name, wamid)
-
-    # 2.7) Construcción de payload de salida
-    payload = None
-    if isinstance(bot_reply, dict) and "reminder_id" in bot_reply:
-        title = bot_reply.get("title") or bot_reply.get("mensaje") or ""
-        date_str = bot_reply.get("date") or bot_reply.get("fecha") or ""
-        payload = get_recordatorio_template_input(wa_id, mensaje=title, fecha=date_str)
-
-    elif isinstance(bot_reply, dict) and "event_id" in bot_reply:
-        # No se envía un WhatsApp extra; sólo confirmamos HTTP 200
-        return {"statusCode": 200, "body": json.dumps({})}
-
-    elif isinstance(bot_reply, dict) and "message" in bot_reply:
-        payload = get_text_message_input(wa_id, str(bot_reply["message"]))
-
-    elif isinstance(bot_reply, str):
-        if bot_reply.strip():
-            payload = get_text_message_input(wa_id, bot_reply.strip())
-        else:
-            logging.warning("[WEBHOOK] bot_reply vacío; no se envía mensaje")
-            return {"statusCode": 200, "body": "ok"}
-
-    else:
-        logging.warning("[WEBHOOK] bot_reply tipo inesperado: %r", type(bot_reply))
-        return {"statusCode": 200, "body": "ok"}
-
-    # 2.8) Enviar mensaje (y persistir wa_msg_id si era recordatorio)
-    if payload:
-        try:
-            resp = send_message(payload)
-            if isinstance(bot_reply, dict) and "reminder_id" in bot_reply:
+            value, contact, msg_obj = result
+            msg_type = msg_obj.get("type", "")
+            wa_id    = contact.get("wa_id")
+            name     = contact.get("profile", {}).get("name", "Desconocido")
+            phone_number_id = value["metadata"]["phone_number_id"]
+            wamid    = msg_obj.get("id")
+            
+            # Obtener timeEpoch para staleness guard
+            request_ctx = event.get("requestContext", {})
+            time_epoch_ms = request_ctx.get("timeEpoch")
+            if not time_epoch_ms:
+                # Fallback: usar timestamp del mensaje
                 try:
-                    card_id = resp["messages"][0]["id"]
-                    evento = db.session.get(Reminder, bot_reply["reminder_id"])
-                    if evento:
-                        evento.wa_msg_id = card_id
-                        db.session.commit()
+                    time_epoch_ms = int(msg_obj.get("timestamp", "0")) * 1000
                 except Exception:
-                    logging.exception("[WEBHOOK] no se pudo persistir card_id")
-        except requests.HTTPError:
-            logging.exception("[send_message] HTTP error; se responde 200 igual")
+                    time_epoch_ms = int(time.time() * 1000)
 
-    return {"statusCode": 200, "body": "ok"}
+            # 2.1) STALENESS GUARD: Rechazar eventos antiguos
+            now_ms = int(time.time() * 1000)
+            stale_threshold_ms = STALE_MINUTES * 60 * 1000
+            
+            if time_epoch_ms < (now_ms - stale_threshold_ms):
+                return {"statusCode": 200, "body": "stale"}
+
+            # 2.2) IDEMPOTENCIA TEMPRANA: Verificar si ya procesamos este wa_msg_id
+            existing_turn = repo_provider.turns.get_by_wa_msg_id(wamid)
+            if existing_turn:
+                logger.info("[CID=%s] [IDEMPOTENT] wa_msg_id=%s", correlation_id, wamid)
+                return {"statusCode": 200, "body": "ok"}
+
+            # 2.3) UX: marcar leído + typing (opcional delay leve)
+            try:
+                indicate_typing(wamid, phone_number_id)
+            except Exception:
+                pass
+            _simulate_typing_delay()
+
+            # 2.4) Gestión de botones
+            if msg_type in ("button", "interactive", "list"):
+                payload_lower, context_id = _extract_button_payload(msg_type, msg_obj)
+                
+                # Persistir turn con contenido de botón
+                button_content = f"[button:{payload_lower}]"
+                repo_provider.turns.append(
+                    phone=wa_id,
+                    conversation_id=wa_id,  # En Dynamo, conversation_id = phone
+                    wa_msg_id=wamid,
+                    ts_ms=time_epoch_ms,
+                    payload={"role": "user", "content": button_content}
+                )
+                
+                _handle_button_action(payload_lower, wa_id, context_id)
+                return {"statusCode": 200, "body": "ok"}
+
+            # 2.5) Audio → transcribir (con tu helper) y usar como user_msg
+            if msg_type == "audio":
+                try:
+                    media_id = msg_obj["audio"]["id"]
+                    text = transcribe_audio(media_id)
+                    # Si es audio reenviado, sólo devolvemos la transcripción al usuario
+                    if msg_obj.get("context", {}).get("forwarded", False):
+                        audio_content = f"[audio_forwarded]: {text}"
+                        # Persistir turn
+                        repo_provider.turns.append(
+                            phone=wa_id,
+                            conversation_id=wa_id,
+                            wa_msg_id=wamid,
+                            ts_ms=time_epoch_ms,
+                            payload={"role": "user", "content": audio_content}
+                        )
+                        
+                        send_message(get_text_message_input(wa_id, text))
+                        return {"statusCode": 200, "body": "ok"}
+                    user_msg = text
+                except Exception:
+                    logging.exception(
+                        "[CID=%s] [audio] fallo transcripción; se sigue con cadena vacía",
+                        correlation_id
+                    )
+                    user_msg = ""
+            else:
+                user_msg = msg_obj.get("text", {}).get("body", "").strip()
+
+            # 2.5b) Persistir turn con contenido final
+            if user_msg:
+                # Guardar turn en DynamoDB
+                repo_provider.turns.append(
+                    phone=wa_id,
+                    conversation_id=wa_id,  # En Dynamo, conversation_id = phone
+                    wa_msg_id=wamid,
+                    ts_ms=time_epoch_ms,
+                    payload={"role": "user", "content": user_msg}
+                )
+
+            # 2.6) Orchestrator → respuesta
+            # La idempotencia está garantizada por el guardado temprano del turn
+            # Pasar repo_provider al orchestrator
+            # TODO: Modificar orchestrator para recibir repo_provider (próxima iteración)
+            bot_reply = orchestrator.handle_message(user_msg or "", wa_id, name, wamid)
+
+            # 2.7) Construcción de payload de salida
+            payload = None
+            if isinstance(bot_reply, dict) and "reminder_id" in bot_reply:
+                title = bot_reply.get("title") or bot_reply.get("mensaje") or ""
+                date_str = bot_reply.get("date") or bot_reply.get("fecha") or ""
+                payload = get_recordatorio_template_input(wa_id, mensaje=title, fecha=date_str)
+
+            elif isinstance(bot_reply, dict) and "event_id" in bot_reply:
+                # No se envía un WhatsApp extra; sólo confirmamos HTTP 200
+                return {"statusCode": 200, "body": json.dumps({})}
+
+            elif isinstance(bot_reply, dict) and "message" in bot_reply:
+                payload = get_text_message_input(wa_id, str(bot_reply["message"]))
+
+            elif isinstance(bot_reply, str):
+                if bot_reply.strip():
+                    payload = get_text_message_input(wa_id, bot_reply.strip())
+                else:
+                    logging.warning("[WEBHOOK] bot_reply vacío; no se envía mensaje")
+                    return {"statusCode": 200, "body": "ok"}
+
+            else:
+                logging.warning("[WEBHOOK] bot_reply tipo inesperado: %r", type(bot_reply))
+                return {"statusCode": 200, "body": "ok"}
+
+            # 2.8) Enviar mensaje (y persistir wa_msg_id si era recordatorio)
+            if payload:
+                try:
+                    resp = send_message(payload)
+                    if isinstance(bot_reply, dict) and "reminder_id" in bot_reply:
+                        try:
+                            card_id = resp["messages"][0]["id"]
+                            # Actualizar wa_msg_id en DynamoDB
+                            repo_provider.reminders.update_wa_msg_id_by_reminder_id(
+                                phone=wa_id,
+                                reminder_id=bot_reply["reminder_id"],
+                                wa_msg_id=card_id
+                            )
+                        except Exception:
+                            logging.exception("[CID=%s] [WEBHOOK] no se pudo persistir card_id", correlation_id)
+                except requests.HTTPError:
+                    logging.exception("[send_message] HTTP error; se responde 200 igual")
+
+            return {"statusCode": 200, "body": "ok"}
+        
+        finally:
+            # Limpiar correlation_id del contexto
+            if hasattr(APP, 'correlation_id'):
+                delattr(APP, 'correlation_id')

@@ -8,7 +8,6 @@ import re
 from flask import current_app
 from flask import current_app as app
 from app.services.bot_logic import BotLogic
-from app.models import db, Reminder
 import tempfile
 from app.services.openai_client import client as openai_client
 
@@ -24,7 +23,11 @@ def _cancel_reminder_via_orchestrator(recipient: str, context_id: str | None) ->
     if not context_id:
         return False
     from app.services.orchestrator import Orchestrator
-    orch = Orchestrator(openai_client, db_session=db.session)
+    from app.db import RepositoryProvider
+    
+    # Crear repo_provider para pasar al Orchestrator
+    repo_provider = RepositoryProvider()
+    orch = Orchestrator(openai_client, repo_provider=repo_provider)
     return orch.cancel_reminder(phone=recipient, context_id=context_id)
 
 
@@ -284,21 +287,8 @@ def send_message(payload: dict) -> dict:
 
 def process_whatsapp_message(body: dict):
     try:
-        app.logger.debug("➡️  Entrando a process_whatsapp_message()")
         msg = body["entry"][0]["changes"][0]["value"]["messages"][0]
-
-        app.logger.debug("📥 Mensaje completo recibido:\n%s",
-                      json.dumps(msg, indent=2, ensure_ascii=False))
-
         msg_type = msg.get("type")
-        app.logger.debug("ℹ️  msg_type = %s", msg_type)
-        app.logger.debug(f"📩 Tipo de mensaje recibido: {msg_type}")
-
-        # Si es interactivo, volcar sub-objeto
-        if msg_type == "interactive":
-            interactive = msg.get("interactive", {})
-            app.logger.debug("🔘 Interactive payload:\n%s",
-                          json.dumps(interactive, indent=2, ensure_ascii=False))
 
         # Emisor y contacto
         sender = msg["from"]
@@ -311,9 +301,6 @@ def process_whatsapp_message(body: dict):
         # ────────────────────────────────────────────────────────────────
 
         if msg_type in ("button", "interactive", "list"):
-            app.logger.debug("🔘 Acción del usuario:\n%s",
-                          json.dumps(msg, indent=2, ensure_ascii=False))
-
             # ▸ Extraer payload según la estructura que envía Meta
             if msg_type == "button":  # Cloud API v16
                 payload = msg.get("button", {}).get("payload", "").lower()
@@ -330,11 +317,8 @@ def process_whatsapp_message(body: dict):
                        .get("id", "")
                 ).lower()
 
-            app.logger.debug(f"🔕 Acción rápida recibida, payload: {payload!r}")
-
             # ▸ Cancelar recordatorio
             if payload == "Cancelar":
-                app.logger.debug("🔕 Usuario solicitó cancelar el recordatorio")
                 cancelled = _cancel_reminder_via_orchestrator(
                     recipient,
                     msg.get("context", {}).get("id", "")
@@ -352,7 +336,6 @@ def process_whatsapp_message(body: dict):
         # Manejo de Texto
         if msg_type == "text":
             text = msg["text"]["body"]
-            app.logger.debug(f"🔎 Procesando texto: {text!r}")
             if g_logic.validate_date_format(text):
                 response = f"✅ La fecha {text.strip()} es válida."
             elif (day := g_logic.get_day_of_date(text)):
@@ -361,14 +344,11 @@ def process_whatsapp_message(body: dict):
                 response = until
 
             if not response:
-                logging.info("   → Llamando a ChatGPT")
                 send_message(get_text_message_input(recipient, "⏳ Consultando API de ChatGPT..."))
                 response = generate_response(text, sender, name)
-                logging.info(f"   → generate_response retornó: {response!r}")
                 send_message(get_text_message_input(recipient, "✅ Respuesta de ChatGPT recibida"))
 
             # Normalizar respuesta
-
             if isinstance(response, dict) and "title" in response and "date" in response:
                 # Mantener dict para plantilla
                 response = {
@@ -381,15 +361,11 @@ def process_whatsapp_message(body: dict):
 
         elif msg_type == "audio":
             media_id = msg["audio"]["id"]
-            logging.info(f"🔊 Nota de voz recibida (media_id={media_id})")
-
             text = transcribe_audio(media_id)
-            logging.info(f"📝 Transcripción Whisper: {text!r}")
 
             # Re-usar el MISMO flujo que para texto 👇
             # ✔️ Nuevo flujo según si es reenviado o no
             if msg.get("context", {}).get("forwarded", False):
-                app.logger.debug("[AUDIO] Mensaje reenviado → solo transcripción")
                 send_message(
                     get_text_message_input(
                         recipient,
@@ -421,7 +397,6 @@ def process_whatsapp_message(body: dict):
         # Evitar enviar mensajes vacíos (previene error 400)
         # ──────────────────────────────────────────────────────────────
         if not response or (isinstance(response, str) and not response.strip()):
-            app.logger.debug("🛑 Respuesta vacía; no se envía nada al usuario.")
             return        
         if isinstance(response, dict) and "mensaje" in response and "fecha" in response:
             payload = get_recordatorio_template_input(
@@ -432,9 +407,8 @@ def process_whatsapp_message(body: dict):
         else:
             payload = get_text_message_input(recipient, response)
         send_message(payload)
-        print("⬅️  process_whatsapp_message() finalizado")
     except Exception:
-        print("❌ Error en process_whatsapp_message:", exc_info=True)
+        logging.exception("Error in process_whatsapp_message")
 
 # -----------------------------------------------------------
 #  AUDIO HELPERS
@@ -498,10 +472,6 @@ def is_valid_whatsapp_message(body: dict) -> bool:
         value  = change.get("value", {})
         msgs   = value.get("messages", [])
 
-        app.logger.debug(
-            "[VALIDACIÓN] field=%s  len(messages)=%d", field, len(msgs)
-        )
-
         return field == "messages" and isinstance(msgs, list) and len(msgs) > 0
     except (KeyError, IndexError, TypeError):
         app.logger.exception("[VALIDACIÓN] Error analizando estructura del webhook")
@@ -515,7 +485,6 @@ def send_comida_template(recipient: str,
     Wrapper que construye el payload de la plantilla «comida»
     y reutiliza la función `send_message`.
     """
-    current_app.logger.info(f"[WhatsApp] Enviando plantilla 'comida' a {recipient}")
     payload = get_comida_template_input(recipient, nombre, numero, texto)
     return send_message(payload)
 

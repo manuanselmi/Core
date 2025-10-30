@@ -1,85 +1,75 @@
-from datetime import datetime
-from app.models import db, ScheduledMessage
+import logging
+import time
+import uuid as uuid_lib
+from datetime import datetime, timezone
 from app.utils.whatsapp_utils import send_comida_template
-from flask import current_app
+
+logger = logging.getLogger("scheduled_message_service")
 
 
 class ScheduledMessageService:
     @staticmethod
-    def create(customer_id: int, target_phone: str, text: str, send_at: datetime) -> int:
-        sm = ScheduledMessage(
-            customer_id=customer_id,
-            target_phone=target_phone,
-            text=text,
-            send_at=send_at,
+    def create(customer_id: int, target_phone: str, text: str, send_at: datetime, repo_provider=None) -> int:
+        """
+        Crea un mensaje programado.
+        
+        Args:
+            customer_id: DEPRECADO (no usado en DynamoDB)
+            target_phone: Teléfono destino
+            text: Contenido del mensaje
+            send_at: Datetime UTC de cuándo enviar
+            repo_provider: RepositoryProvider (requerido)
+            
+        Returns:
+            Timestamp epoch_ms como "ID" del mensaje
+        """
+        if not repo_provider:
+            logger.error("[ScheduledMessageService] repo_provider es requerido")
+            return -1
+        
+        # Convertir send_at a epoch_ms
+        if send_at.tzinfo is None:
+            send_at = send_at.replace(tzinfo=timezone.utc)
+        send_at_ms = int(send_at.timestamp() * 1000)
+        
+        # Generar UUID único
+        msg_uuid = str(uuid_lib.uuid4())
+        
+        # Preparar payload
+        data = {
+            "target_phone": target_phone,
+            "text": text,
+        }
+        
+        # Enqueue en DynamoDB
+        repo_provider.scheduled_messages.enqueue(
+            phone=target_phone,
+            send_at_ms=send_at_ms,
+            uuid=msg_uuid,
+            data=data
         )
-        db.session.add(sm)
-        db.session.commit()
-        return sm.id
+        
+        logger.info(
+            "[ScheduledMessageService] Mensaje programado: phone=%s send_at=%s uuid=%s",
+            target_phone, send_at.isoformat(), msg_uuid
+        )
+        
+        # Retornar timestamp como "ID"
+        return send_at_ms
 
     @staticmethod
-    def run(sm_id: int):
+    def send(target_phone: str, customer_name: str, text: str) -> None:
         """
-        Job lanzado por APScheduler.  Se asegura de abrir un `app_context`
-        antes de tocar la BD o usar utilidades que dependen de Flask.
-        """
-        # ─── Garantizar contexto ────────────────────────────────────
-        from flask import current_app
-        try:
-            app = current_app._get_current_object()
-        except RuntimeError:
-            # No hay contexto activo → creamos uno nuevo
-            from app import create_app
-            app = create_app()
-        app.logger.info(f"[ScheduledMessageService] Ejecutando mensaje programado {sm_id}")
+        Envía un mensaje inmediatamente (no programado).
         
-        with app.app_context():
-            sm = ScheduledMessage.query.get(sm_id)
-            if not sm or sm.status != "pending":
-                return
-            try:
-                app.logger.info(f"[ScheduledMessageService] Enviando mensaje a {sm.target_phone}")
-                send_comida_template(  
-                    sm.target_phone,
-                    sm.customer.name,  # Access the related customer object
-                    sm.customer.phone,  # Access the related customer object
-                    sm.text,
-                )
-                sm.mark_sent()
-                db.session.delete(sm)
-                db.session.commit()
-            except Exception:
-                sm.mark_error()
-                raise
-            
-    @staticmethod
-    def reschedule_all_messages(scheduler):
+        Args:
+            target_phone: Teléfono destino
+            customer_name: Nombre del destinatario
+            text: Contenido del mensaje
         """
-        Reprograma todos los mensajes pendientes al arrancar la aplicación.
-        """
-        from flask import current_app
         try:
-            app = current_app._get_current_object()
-        except RuntimeError:
-            # No hay contexto activo → creamos uno nuevo
-            from app import create_app
-            app = create_app()
-            
-        with app.app_context():
-            messages = ScheduledMessage.query.filter_by(status="pending").all()
-            app.logger.info(
-                f"[ScheduledMessageService] Reprogramando {len(messages)} mensajes pendientes."
-            )
-            for sm in messages:
-                scheduler.add_job(
-                    ScheduledMessageService.run,
-                    trigger="date",
-                    run_date=sm.send_at,
-                    args=[sm.id],
-                    id=f"scheduled_message_{sm.id}",
-                    replace_existing=True,
-                )
-                
-def reschedule_all_messages(scheduler):
-    """Alias para mantener imports existentes."""
-    return ScheduledMessageService.reschedule_all_messages(scheduler)
+            send_comida_template(target_phone, customer_name, target_phone, text)
+            logger.info("[ScheduledMessageService] Mensaje enviado: phone=%s", target_phone)
+        except Exception:
+            logger.exception("[ScheduledMessageService] Error enviando mensaje a %s", target_phone)
+            raise

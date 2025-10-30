@@ -7,11 +7,8 @@ from typing import Optional
 
 from flask import current_app
 from zoneinfo import ZoneInfo
-from sqlalchemy import select
-from sqlalchemy.orm import Session
 
-from app.models import db, ScheduledMessage, Reminder, Customer
-from app.services.scheduled_message_service import ScheduledMessageService
+from app.db import RepositoryProvider
 from app.utils.whatsapp_utils import (
     get_event_reminder_template_input,
     send_message,
@@ -23,6 +20,7 @@ from app.utils.whatsapp_utils import (
 
 _app = None          # se setea en init_scheduler(app)
 _initialized = False
+_repo_provider = None  # RepositoryProvider para DynamoDB
 
 # Parametrizable por env
 BATCH_LIMIT = int(os.getenv("SCHED_BATCH_LIMIT", "100"))
@@ -56,9 +54,10 @@ def init_scheduler(app):
     Compat: guarda la referencia de app y fija TZ.
     En AWS NO se inicia ningún thread ni APScheduler.
     """
-    global _app, _initialized
+    global _app, _initialized, _repo_provider
     _app = app
     _initialized = True
+    _repo_provider = RepositoryProvider()
     tz = ZoneInfo(LOCAL_TZ_NAME)
     if _app:
         _app.logger.info("[SchedulerService] (EventBridge) iniciado. TZ=%s", tz)
@@ -69,6 +68,13 @@ def _require_app():
     if not _initialized or _app is None:
         raise RuntimeError("SchedulerService no iniciado. Llama init_scheduler(app)")
     return _app
+
+
+def _require_repo() -> RepositoryProvider:
+    """Obtiene RepositoryProvider (DynamoDB) para acceso a datos."""
+    if _repo_provider is None:
+        raise RuntimeError("SchedulerService no iniciado. Llama init_scheduler(app)")
+    return _repo_provider
 
 
 # ────────────────────────────────────────────────────────────────────
@@ -83,184 +89,195 @@ def _now_local() -> datetime:
     return datetime.now(ZoneInfo(LOCAL_TZ_NAME))
 
 
+def _now_ms() -> int:
+    """Epoch timestamp en milisegundos (UTC)."""
+    return int(_now_utc().timestamp() * 1000)
+
+
 # ────────────────────────────────────────────────────────────────────
 # API de programación (compat)
 # ────────────────────────────────────────────────────────────────────
 
 def schedule_event_reminder(_ignored_scheduler, reminder_id: int, advance: timedelta = timedelta(minutes=1)) -> None:
     """
-    Persiste lo necesario en BD; el envío real lo hará run_due_jobs().
-    - (Opcional) genera un ScheduledMessage de 'pre-aviso' si corresponde.
+    DEPRECADO: Esta función era para SQL-based reminders.
+    Con DynamoDB, los reminders se crean directamente via repos.
+    Se mantiene por compatibilidad pero no hace nada.
     """
     app = _require_app()
-    with app.app_context():
-        rem: Reminder | None = (
-            db.session.query(Reminder)
-            .join(Customer)
-            .filter(Reminder.id == reminder_id)
-            .first()
-        )
-        if not rem:
-            return
-
-        local_tz = ZoneInfo(LOCAL_TZ_NAME)
-        rdt = rem.date
-        rdt_local = rdt.replace(tzinfo=local_tz) if rdt.tzinfo is None else rdt.astimezone(local_tz)
-
-        if advance and advance.total_seconds() > 0:
-            pre_dt_local = rdt_local - advance
-            if pre_dt_local > _now_local():
-                text = f"⏰ Recordatorio próximo: «{rem.titulo}» a las {rdt_local.strftime('%H:%M')}."
-                ScheduledMessageService.create(
-                    customer_id=rem.customer_id,
-                    target_phone=rem.customer.phone,
-                    text=text,
-                    send_at=pre_dt_local.astimezone(timezone.utc),
-                )
+    app.logger.warning(
+        "[SchedulerService] schedule_event_reminder(%s) deprecado. "
+        "Los reminders se crean directamente con repos DynamoDB.",
+        reminder_id
+    )
 
 
 def schedule_scheduled_message(_ignored_scheduler, sm_id: int, send_at: datetime) -> None:
     """
-    Asegura la fecha esperada; el envío lo hará run_due_jobs().
+    DEPRECADO: Esta función era para SQL-based scheduled messages.
+    Con DynamoDB, los mensajes se encolan directamente via repos.
+    Se mantiene por compatibilidad pero no hace nada.
     """
     app = _require_app()
-    with app.app_context():
-        sm = db.session.get(ScheduledMessage, sm_id)
-        if not sm:
-            return
-        if send_at.tzinfo is None:
-            send_at = send_at.replace(tzinfo=ZoneInfo(LOCAL_TZ_NAME)).astimezone(timezone.utc)
-        else:
-            send_at = send_at.astimezone(timezone.utc)
-
-        if sm.send_at != send_at:
-            sm.send_at = send_at
-            db.session.commit()
+    app.logger.warning(
+        "[SchedulerService] schedule_scheduled_message(%s) deprecado. "
+        "Los mensajes se encolan directamente con repos DynamoDB.",
+        sm_id
+    )
 
 
 def cancel_scheduled_message(sm_id: int) -> bool:
-    """Eliminar de BD (si no existe, no se enviará)."""
+    """
+    DEPRECADO: Con DynamoDB no tenemos un sm_id numérico simple.
+    Los mensajes se cancelan directamente via repos DynamoDB con pk/sk.
+    """
     app = _require_app()
-    with app.app_context():
-        sm = db.session.get(ScheduledMessage, sm_id)
-        if not sm:
-            return False
-        db.session.delete(sm)
-        db.session.commit()
-        return True
-
-
-# ────────────────────────────────────────────────────────────────────
-# Claim & Send (idempotente, concurrente-safe)
-# ────────────────────────────────────────────────────────────────────
-
-def _claim_pending_scheduled_messages(sess: Session, now_utc: datetime, limit: int) -> list[ScheduledMessage]:
-    """
-    Toma en exclusiva (SKIP LOCKED) un batch de mensajes pendientes.
-    Evita doble envío si hay dos Lambdas corriendo en paralelo.
-    """
-    # Bloqueamos filas PENDING con send_at vencido
-    q = (
-        select(ScheduledMessage)
-        .where(ScheduledMessage.status == "pending", ScheduledMessage.send_at <= now_utc)
-        .order_by(ScheduledMessage.send_at.asc())
-        .limit(limit)
-        .with_for_update(skip_locked=True)
+    app.logger.warning(
+        "[SchedulerService] cancel_scheduled_message(%s) deprecado. "
+        "Usar repos DynamoDB directamente con pk/sk.",
+        sm_id
     )
-    rows = sess.execute(q).scalars().all()
-    # Marcamos 'sending' en la misma transacción
-    for r in rows:
-        r.status = "sending"
-        r.claimed_at = now_utc
-    return rows
+    return False
 
 
-def _process_scheduled_messages(sess: Session, rows: list[ScheduledMessage], now_utc: datetime) -> int:
+# ────────────────────────────────────────────────────────────────────
+# Claim & Send (idempotente, concurrente-safe) - DynamoDB
+# ────────────────────────────────────────────────────────────────────
+
+def _claim_pending_scheduled_messages(repo: RepositoryProvider, now_ms: int, limit: int) -> list[dict]:
+    """
+    Reclama batch de mensajes programados pendientes usando DynamoDB.
+    
+    Notes:
+        - Usa claim_pending_batch() del repo con ConditionExpression atómico
+        - Retorna lista de mensajes reclamados con status='sending'
+    """
+    return repo.scheduled_messages.claim_pending_batch(
+        now_ms=now_ms,
+        n=limit,
+        stale_after_ms=60000  # 1 min stale threshold
+    )
+
+
+def _process_scheduled_messages(repo: RepositoryProvider, rows: list[dict], now_ms: int) -> int:
+    """
+    Procesa mensajes programados reclamados: envía y marca como sent/error.
+    """
     sent = 0
-    for sm in rows:
+    for msg in rows:
         try:
-            ScheduledMessageService.send(sm.id)  # se encarga de construir y enviar
-            sm.status = "sent"
-            sm.sent_at = now_utc
+            # Enviar mensaje
+            target_phone = msg.get('target_phone')
+            text = msg.get('text')
+            
+            if not target_phone or not text:
+                logging.warning("[SchedulerService] Mensaje sin target_phone o text: %s", msg)
+                continue
+            
+            # Construir payload y enviar
+            from app.utils.whatsapp_utils import send_comida_template
+            customer_name = msg.get('customer_phone', target_phone)  # fallback
+            
+            result = send_comida_template(
+                recipient=target_phone,
+                name=customer_name,
+                phone=target_phone,
+                message=text
+            )
+            
+            wa_msg_id = result.get('messages', [{}])[0].get('id', 'unknown')
+            
+            # Marcar como sent
+            key = {'pk': msg['pk'], 'sk': msg['sk']}
+            repo.scheduled_messages.mark_sent(key=key, wa_msg_id=wa_msg_id, at_ms=now_ms)
             sent += 1
+            
         except Exception:
-            logging.exception("[SchedulerService] Error enviando ScheduledMessage id=%s", sm.id)
-            sm.status = "error"
-            sm.error_at = now_utc
+            logging.exception("[SchedulerService] Error enviando ScheduledMessage: %s", msg)
+            # Marcar como error (si existe método mark_failed en repo)
+            try:
+                key = {'pk': msg['pk'], 'sk': msg['sk']}
+                repo.scheduled_messages.update_conditional(
+                    key=key,
+                    update_expr='SET #st = :error, error_at = :at',
+                    expr_attr_names={'#st': 'status'},
+                    expr_attr_values={':error': 'error', ':at': now_ms}
+                )
+            except Exception:
+                logging.exception("[SchedulerService] Error marcando mensaje como error")
+    
     return sent
 
 
-def _claim_due_reminders(sess: Session, now_local: datetime, limit: int) -> list[Reminder]:
+def _claim_due_reminders(repo: RepositoryProvider, now_ms: int, limit: int) -> list[dict]:
     """
-    Selecciona recordatorios vencidos. Usamos SKIP LOCKED via select+delete por ítem.
-    Si tu tabla crece, agregá índice por `date`.
-    NOTA: Los reminders vinculados a appointments (appointment_id NOT NULL) se manejan
-    vía _claim_due_appointments; aquí solo procesamos reminders standalone.
+    Selecciona recordatorios standalone vencidos (no vinculados a appointments).
+    
+    Notes:
+        - En DynamoDB, los reminders standalone se consultan por customer
+        - No hay un query global directo, pero podemos usar GSI si está disponible
+        - Por ahora, esta función retorna lista vacía porque los reminders
+          vinculados a appointments se procesan en _claim_due_appointments
     """
-    from app.models import Reminder
-    q = (
-        select(Reminder)
-        .join(Customer)
-        .filter(Reminder.appointment_id.is_(None))  # Solo reminders NO vinculados a appointments
-        .order_by(Reminder.date.asc())
-        .limit(limit)
-        .with_for_update(skip_locked=True)
-    )
-    candidates = sess.execute(q).scalars().all()
-    due: list[Reminder] = []
-    local_tz = ZoneInfo(LOCAL_TZ_NAME)
-    for r in candidates:
-        rdt = r.date
-        rdt_local = rdt.replace(tzinfo=local_tz) if rdt.tzinfo is None else rdt.astimezone(local_tz)
-        if rdt_local <= now_local:
-            due.append(r)
-    return due
+    # TODO: Implementar query global de reminders standalone si es necesario
+    # Por ahora, los reminders standalone no tienen GSI de vencimiento
+    # Se procesan manualmente o se eliminan de la funcionalidad
+    return []
 
 
-def _process_reminders(sess: Session, rows: list[Reminder]) -> int:
+def _process_reminders(repo: RepositoryProvider, rows: list[dict]) -> int:
+    """
+    Procesa reminders standalone vencidos.
+    
+    Notes:
+        - Esta función no se usa actualmente porque los reminders
+          standalone no tienen query global en DynamoDB
+    """
     sent = 0
     for r in rows:
         try:
+            phone = r.get('customer_phone')
+            titulo = r.get('titulo')
+            
+            if not phone or not titulo:
+                logging.warning("[SchedulerService] Reminder sin phone o titulo: %s", r)
+                continue
+            
             payload = get_event_reminder_template_input(
-                recipient=r.customer.phone,
-                titulo=r.titulo,
+                recipient=phone,
+                titulo=titulo,
             )
             send_message(payload)
-            sess.delete(r)  # idempotencia: no vuelve a aparecer en próximas corridas
+            
+            # Eliminar reminder (idempotencia)
+            key = {'pk': r['pk'], 'sk': r['sk']}
+            repo.reminders.delete_conditional(key)
             sent += 1
+            
         except Exception:
-            logging.exception("[SchedulerService] Error enviando Reminder id=%s", r.id)
+            logging.exception("[SchedulerService] Error enviando Reminder: %s", r)
+    
     return sent
 
 
-def _claim_due_appointments(sess: Session, now_utc: datetime, limit: int) -> list:
+def _claim_due_appointments(repo: RepositoryProvider, now_ms: int, limit: int) -> list[dict]:
     """
-    Selecciona appointments con recordatorio pendiente (status='scheduled' AND reminder_status='pending' AND remind_at <= now).
-    Usa SKIP LOCKED para evitar procesamiento duplicado.
+    Selecciona appointments con recordatorio pendiente usando DynamoDB GSI.
+    
+    Notes:
+        - Usa query_due_reminders() del appointment_repo
+        - GSI ApptReminderQueue: PK='pending#scheduled', SK=remind_at_epoch
+        - No requiere SKIP LOCKED porque DynamoDB es event-driven
     """
-    from app.models import Appointment
-    q = (
-        select(Appointment)
-        .filter(
-            Appointment.status == 'scheduled',
-            Appointment.reminder_status == 'pending',
-            Appointment.remind_at <= now_utc
-        )
-        .order_by(Appointment.remind_at.asc())
-        .limit(limit)
-        .with_for_update(skip_locked=True)
-    )
-    rows = sess.execute(q).scalars().all()
-    return rows
+    return repo.appointments.query_due_reminders(now_ms=now_ms, limit=limit)
 
 
-def _process_appointments(sess: Session, rows: list, now_utc: datetime) -> tuple[int, int, int]:
+def _process_appointments(repo: RepositoryProvider, rows: list[dict], now_ms: int) -> tuple[int, int, int]:
     """
     Procesa appointments para enviar recordatorios.
     Valida existencia del evento en Google Calendar antes de enviar.
     Retorna (sent, skipped, canceled_detected).
     """
-    from app.models import Appointment, Customer
     from app.services.google_calendar_service import GoogleCalendarService
     from app.config.settings import SETTINGS
     
@@ -277,50 +294,90 @@ def _process_appointments(sess: Session, rows: list, now_utc: datetime) -> tuple
     for appt in rows:
         try:
             # Validar existencia del evento en Google Calendar
-            if gcal and appt.google_event_id:
-                event = gcal.get_event(appt.google_event_id, appt.google_calendar_id)
+            google_event_id = appt.get('google_event_id')
+            google_calendar_id = appt.get('google_calendar_id')
+            
+            if gcal and google_event_id:
+                event = gcal.get_event(google_event_id, google_calendar_id)
                 if not event or event.get("status") == "cancelled":
                     # Evento no existe o fue cancelado externamente
                     logging.info(
-                        "[SchedulerService] Evento cancelado/inexistente en Google: appt_id=%s, event_id=%s",
-                        appt.id, appt.google_event_id
+                        "[SchedulerService] Evento cancelado/inexistente en Google: appt=%s, event_id=%s",
+                        appt.get('appointment_id'), google_event_id
                     )
-                    appt.status = 'canceled'
-                    appt.reminder_status = 'skipped'
-                    appt.cancel_reason = "Cancelado externamente (detectado al enviar recordatorio)"
+                    
+                    # Actualizar status en DynamoDB
+                    key = {'pk': appt['pk'], 'sk': appt['sk']}
+                    repo.appointments.update_conditional(
+                        key=key,
+                        update_expr='SET #st = :canceled, #rs = :skipped, cancel_reason = :reason',
+                        expr_attr_names={'#st': 'status', '#rs': 'reminder_status'},
+                        expr_attr_values={
+                            ':canceled': 'canceled',
+                            ':skipped': 'skipped',
+                            ':reason': 'Cancelado externamente (detectado al enviar recordatorio)'
+                        }
+                    )
                     canceled_detected += 1
                     continue
             
-            # Obtener customer
-            customer = sess.get(Customer, appt.customer_id)
-            if not customer or not customer.phone:
-                logging.warning("[SchedulerService] Customer no encontrado o sin teléfono: appt_id=%s", appt.id)
-                appt.reminder_status = 'error'
+            # Obtener customer phone
+            customer_phone = appt.get('customer_phone')
+            if not customer_phone:
+                logging.warning("[SchedulerService] Appointment sin customer_phone: %s", appt)
+                key = {'pk': appt['pk'], 'sk': appt['sk']}
+                repo.appointments.update_reminder_status(
+                    pk=appt['pk'],
+                    sk=appt['sk'],
+                    new_status='error'
+                )
                 continue
             
             # Construir mensaje de recordatorio
             agent_name = SETTINGS.AGENT_NAME
             titulo = f"Tenés turno con {agent_name} en una hora."
-            if appt.title:
-                titulo = f"Recordatorio: {appt.title}"
+            if appt.get('title'):
+                titulo = f"Recordatorio: {appt['title']}"
             
             # Enviar recordatorio
             payload = get_event_reminder_template_input(
-                recipient=customer.phone,
+                recipient=customer_phone,
                 titulo=titulo
             )
             send_message(payload)
             
             # Marcar como enviado
-            appt.reminder_status = 'sent'
-            appt.last_reminder_sent_at = now_utc
+            repo.appointments.update_reminder_status(
+                pk=appt['pk'],
+                sk=appt['sk'],
+                new_status='sent'
+            )
+            
+            # Actualizar last_reminder_sent_at
+            key = {'pk': appt['pk'], 'sk': appt['sk']}
+            repo.appointments.update_conditional(
+                key=key,
+                update_expr='SET last_reminder_sent_at = :at',
+                expr_attr_names={},
+                expr_attr_values={':at': now_ms}
+            )
+            
             sent += 1
-            logging.info("[SchedulerService] Recordatorio enviado: appt_id=%s, customer=%s", 
-                        appt.id, customer.phone)
+            logging.info(
+                "[SchedulerService] Recordatorio enviado: appt=%s, customer=%s",
+                appt.get('appointment_id'), customer_phone
+            )
             
         except Exception:
-            logging.exception("[SchedulerService] Error procesando Appointment id=%s", appt.id)
-            appt.reminder_status = 'error'
+            logging.exception("[SchedulerService] Error procesando Appointment: %s", appt)
+            try:
+                repo.appointments.update_reminder_status(
+                    pk=appt['pk'],
+                    sk=appt['sk'],
+                    new_status='error'
+                )
+            except Exception:
+                logging.exception("[SchedulerService] Error marcando appointment como error")
     
     return (sent, skipped, canceled_detected)
 
@@ -333,34 +390,33 @@ def run_due_jobs() -> dict:
     """
     Llamar sólo cuando la invocación provenga de EventBridge.
     Retorna métricas simples para logs/CloudWatch.
+    
+    Notes:
+        - Usa DynamoDB repos exclusivamente (sin SQLAlchemy)
+        - Procesa: scheduled messages, appointments, reminders standalone
     """
     app = _require_app()
-    now_utc = _now_utc()
-    now_local = _now_local()
+    repo = _require_repo()
+    now_ms = _now_ms()
 
     with app.app_context():
-        # Usamos una única sesión/tx por batch para reducir round-trips
         # 1) Scheduled Messages
-        with db.session.begin():
-            rows_sm = _claim_pending_scheduled_messages(db.session, now_utc, BATCH_LIMIT)
-        # Fuera del "claim" (liberamos locks), procesamos y persistimos resultado
-        with db.session.begin():
-            sent_msgs = _process_scheduled_messages(db.session, rows_sm, now_utc)
+        rows_sm = _claim_pending_scheduled_messages(repo, now_ms, BATCH_LIMIT)
+        sent_msgs = _process_scheduled_messages(repo, rows_sm, now_ms)
 
         # 2) Appointments (recordatorios de citas)
-        with db.session.begin():
-            rows_appt = _claim_due_appointments(db.session, now_utc, BATCH_LIMIT)
-        with db.session.begin():
-            sent_appt, skipped_appt, canceled_appt = _process_appointments(db.session, rows_appt, now_utc)
+        rows_appt = _claim_due_appointments(repo, now_ms, BATCH_LIMIT)
+        sent_appt, skipped_appt, canceled_appt = _process_appointments(repo, rows_appt, now_ms)
 
         # 3) Reminders (standalone, no vinculados a appointments)
-        with db.session.begin():
-            rows_rem = _claim_due_reminders(db.session, now_local, BATCH_LIMIT)
-            sent_rem = _process_reminders(db.session, rows_rem)
+        # NOTA: Actualmente deshabilitado porque no hay GSI global para reminders standalone
+        rows_rem = _claim_due_reminders(repo, now_ms, BATCH_LIMIT)
+        sent_rem = _process_reminders(repo, rows_rem)
 
     if app:
         app.logger.info(
-            "[SchedulerService] run_due_jobs: scheduled_sent=%s, appointments_sent=%s, appointments_skipped=%s, appointments_canceled_detected=%s, reminders_sent=%s",
+            "[SchedulerService] run_due_jobs: scheduled_sent=%s, appointments_sent=%s, "
+            "appointments_skipped=%s, appointments_canceled_detected=%s, reminders_sent=%s",
             sent_msgs, sent_appt, skipped_appt, canceled_appt, sent_rem,
         )
 

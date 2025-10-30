@@ -1,4 +1,3 @@
-from app.models import db, AssistantConversation, Customer
 import logging
 import uuid
 
@@ -7,118 +6,108 @@ logger = logging.getLogger("assistant_conversation_service")
 
 class AssistantConversationService:
     @staticmethod
-    def find_or_create(wa_phone: str, customer_id: int | None = None) -> AssistantConversation:
+    def find_or_create(wa_phone: str, customer_id: int | None = None, repo_provider=None) -> dict:
         """
         Busca o crea un registro de AssistantConversation para el teléfono dado.
         
         Args:
             wa_phone: Número de WhatsApp del usuario
             customer_id: ID del customer (opcional)
+            repo_provider: RepositoryProvider (requerido)
             
         Returns:
-            Registro de AssistantConversation
+            Dict con campos del AssistantConversation
         """
-        conversation = AssistantConversation.query.filter_by(wa_phone=wa_phone).first()
+        if not repo_provider:
+            raise ValueError("repo_provider es requerido")
         
-        if conversation:
-            # Actualizar last_used_at si es necesario
-            conversation.customer_id = conversation.customer_id or customer_id
-            db.session.commit()
-            logger.info(
-                "[ASST_CONV] Found existing conversation: id=%s wa_phone=%s last_response_id=%s",
-                conversation.id, wa_phone, conversation.last_response_id
-            )
-            return conversation
+        # Usar repo DynamoDB
+        asstconv = repo_provider.assistant_conversations.get_by_phone(wa_phone)
         
-        # Crear nuevo registro
+        if asstconv:
+            # Actualizar customer_id si viene y no estaba
+            if customer_id and not asstconv.get("customer_id"):
+                asstconv["customer_id"] = customer_id
+                repo_provider.assistant_conversations.set(wa_phone, asstconv)
+            
+            return asstconv
+        
+        # Crear nuevo
         conversation_id = str(uuid.uuid4())
-        new_conversation = AssistantConversation(
-            customer_id=customer_id,
-            wa_phone=wa_phone,
-            conversation_id=conversation_id,
-            status="active"
-        )
+        new_conv = {
+            "wa_phone": wa_phone,
+            "customer_id": customer_id,
+            "conversation_id": conversation_id,
+            "status": "active",
+            "last_response_id": None,
+            "last_wa_msg_id": None,
+        }
+        repo_provider.assistant_conversations.set(wa_phone, new_conv)
         
-        db.session.add(new_conversation)
-        db.session.commit()
-        
-        logger.info(
-            "[ASST_CONV] Created new conversation: id=%s wa_phone=%s conversation_id=%s",
-            new_conversation.id, wa_phone, conversation_id
-        )
-        return new_conversation
+        return new_conv
     
     @staticmethod
-    def update_last_response_id(wa_phone: str, response_id: str) -> None:
+    def update_last_response_id(wa_phone: str, response_id: str, repo_provider=None) -> None:
         """
         Actualiza el last_response_id para una conversación.
         
         Args:
             wa_phone: Número de WhatsApp del usuario
             response_id: ID de la última respuesta de OpenAI
+            repo_provider: RepositoryProvider (requerido)
         """
-        conversation = AssistantConversation.query.filter_by(wa_phone=wa_phone).first()
-        
-        if not conversation:
-            logger.warning(
-                "[ASST_CONV] No conversation found for wa_phone=%s, cannot update last_response_id",
-                wa_phone
-            )
+        if not repo_provider:
+            logger.error("[ASST_CONV] repo_provider es requerido")
             return
         
-        conversation.last_response_id = response_id
-        db.session.commit()
+        asstconv = repo_provider.assistant_conversations.get_by_phone(wa_phone)
+        if not asstconv:
+            logger.error("[ASST_CONV] No conversation found for wa_phone=%s", wa_phone)
+            return
         
-        logger.info(
-            "[ASST_CONV] Updated last_response_id: wa_phone=%s response_id=%s",
-            wa_phone, response_id
-        )
+        asstconv["last_response_id"] = response_id
+        repo_provider.assistant_conversations.set(wa_phone, asstconv)
     
     @staticmethod
-    def get_last_response_id(wa_phone: str) -> str | None:
+    def get_last_response_id(wa_phone: str, repo_provider=None) -> str | None:
         """
         Obtiene el last_response_id de una conversación.
         
         Args:
             wa_phone: Número de WhatsApp del usuario
+            repo_provider: RepositoryProvider (requerido)
             
         Returns:
             last_response_id si existe, None en caso contrario
         """
-        conversation = AssistantConversation.query.filter_by(wa_phone=wa_phone).first()
-        
-        if not conversation:
-            logger.debug("[ASST_CONV] No conversation found for wa_phone=%s", wa_phone)
+        if not repo_provider:
+            logger.error("[ASST_CONV] repo_provider es requerido")
             return None
         
-        logger.debug(
-            "[ASST_CONV] Retrieved last_response_id=%s for wa_phone=%s",
-            conversation.last_response_id, wa_phone
-        )
-        return conversation.last_response_id
+        asstconv = repo_provider.assistant_conversations.get_by_phone(wa_phone)
+        if not asstconv:
+            return None
+        
+        return asstconv.get("last_response_id")
     
     @staticmethod
-    def update_last_wa_msg_id(wa_phone: str, wa_msg_id: str) -> None:
+    def update_last_wa_msg_id(wa_phone: str, wa_msg_id: str, repo_provider=None) -> None:
         """
         Actualiza el last_wa_msg_id para una conversación.
         
         Args:
             wa_phone: Número de WhatsApp del usuario
             wa_msg_id: ID del último mensaje de WhatsApp procesado
+            repo_provider: RepositoryProvider (requerido)
         """
-        conversation = AssistantConversation.query.filter_by(wa_phone=wa_phone).first()
-        
-        if not conversation:
-            logger.warning(
-                "[ASST_CONV] No conversation found for wa_phone=%s, cannot update last_wa_msg_id",
-                wa_phone
-            )
+        if not repo_provider:
+            logger.error("[ASST_CONV] repo_provider es requerido")
             return
         
-        conversation.last_wa_msg_id = wa_msg_id
-        db.session.commit()
+        asstconv = repo_provider.assistant_conversations.get_by_phone(wa_phone)
+        if not asstconv:
+            logger.error("[ASST_CONV] No conversation found for wa_phone=%s", wa_phone)
+            return
         
-        logger.debug(
-            "[ASST_CONV] Updated last_wa_msg_id: wa_phone=%s wa_msg_id=%s",
-            wa_phone, wa_msg_id
-        )
+        asstconv["last_wa_msg_id"] = wa_msg_id
+        repo_provider.assistant_conversations.set(wa_phone, asstconv)

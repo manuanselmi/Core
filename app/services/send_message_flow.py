@@ -20,12 +20,18 @@ class SendMessageFlow:
 
     • Deduplicación intra-proceso con TTLCache (120 s).
     • Conversión y validación de la hora en **America/Montevideo**.
-    • Si la hora queda en el pasado (<24 h) la mueve a “mañana”.
+    • Si la hora queda en el pasado (<24 h) la mueve a "mañana".
     """
 
-    def __init__(self) -> None:
+    def __init__(self, repo_provider=None) -> None:
         self.state: Dict[str, Dict] = {}
         self._recent_ops: TTLCache[str, bool] = TTLCache(maxsize=500, ttl=120)
+        
+        # Repo provider para DynamoDB
+        if repo_provider is None:
+            from app.db import RepositoryProvider
+            repo_provider = RepositoryProvider()
+        self.repo = repo_provider
 
     # ------------------------------------------------------------------
     # Entrada principal (el Orchestrator/LLM hace el parseo)
@@ -133,12 +139,11 @@ class SendMessageFlow:
         from app.services.scheduled_message_service import ScheduledMessageService
         from app.services import scheduler_service
         from app.utils.whatsapp_utils import send_recordatorio_mensaje
-        from app.models import ScheduledMessage, db
 
-        # Persistir y agendar
+        # Persistir y agendar usando repo_provider
         from flask import current_app as app
         app.logger.info(
-            f"[SendMessageFlow] Programando BEE mensaje a {data['target']} "
+            f"[SendMessageFlow] Programando mensaje a {data['target']} "
             f"para {send_dt.strftime('%d/%m/%Y %H:%M')}"
         )
         sm_id = ScheduledMessageService.create(
@@ -146,6 +151,7 @@ class SendMessageFlow:
             target_phone=data["target"],
             text=data["text"],
             send_at=send_dt,
+            repo_provider=self.repo  # Pasar repo_provider
         )
         scheduler_service.schedule_scheduled_message(
             scheduler_service.scheduler,
@@ -162,9 +168,13 @@ class SendMessageFlow:
                     fecha=send_dt.strftime("%d/%m/%Y %H:%M"),
             )
             wa_msg_id = (resp.get("messages") or [{}])[0].get("id")
-            sm = ScheduledMessage.query.get(sm_id)
-            sm.wa_msg_id = wa_msg_id          # puede quedar NULL si Meta no responde, no pasa nada
-            db.session.commit()
+            
+            # Actualizar wa_msg_id usando repo (en lugar de SQLAlchemy)
+            # Nota: sm_id ahora es epoch_ms, necesitamos construir las claves
+            if wa_msg_id and sm_id:
+                # TODO: Implementar update_wa_msg_id en scheduled_message_repo si es necesario
+                # Por ahora, el wa_msg_id se puede actualizar cuando se procese el mensaje
+                app.logger.info(f"[SendMessageFlow] wa_msg_id={wa_msg_id} para sm_id={sm_id}")
 
         
         

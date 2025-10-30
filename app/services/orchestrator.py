@@ -16,13 +16,11 @@ from functools import lru_cache
 from app.prompts import load_kairito
 from flask import current_app 
 
-from requests import Session
 from app.services.customer_service import CustomerService
 from app.services.assistant_conversation_service import AssistantConversationService
 import app.services.scheduler_service as scheduler_service
 from app.utils.datetime_utils import parse_iso8601
 from app.services.weather_service import get_forecast
-from app.models import db, Reminder, Customer, ScheduledMessage, AssistantConversation
 from app.services.google_calendar_service import GoogleCalendarService
 from app.services.send_message_flow import SendMessageFlow
 from zoneinfo import ZoneInfo
@@ -75,13 +73,20 @@ def extract_tool_calls(resp) -> list:
     return calls
     
 class Orchestrator:
-    def __init__(self, client: OpenAI, db_session: Session, catalog_path: str = "functions_catalog.json"):
+    def __init__(self, client: OpenAI, catalog_path: str = "functions_catalog.json", repo_provider=None):
         self.client = client
-        self.db = db_session
         self.catalog_path = catalog_path
         self.current_customer_id = None
         self.current_phone = None
         self.current_name = None
+        
+        # Dynamo repositories (fallback si no se inyecta)
+        if repo_provider is None:
+            from app.db import RepositoryProvider
+            repo_provider = RepositoryProvider()
+        self.repo = repo_provider
+        self.correlation_id_provider = getattr(repo_provider, 'correlation_id_provider', lambda: 'no-cid')
+        
         self.logger = logging.getLogger("Orchestrator")
         if not self.logger.handlers:
             handler = logging.StreamHandler()
@@ -107,12 +112,29 @@ class Orchestrator:
         )
         self.send_msg_flow = SendMessageFlow()
 
+    def _safe_current_cid(self):
+        """
+        Accede de forma segura a current_app.correlation_id sin romper cuando no hay contexto.
+        
+        Returns:
+            str | None: correlation_id desde Flask app context, o None si no está disponible
+        """
+        try:
+            from flask import current_app
+            return getattr(current_app, "correlation_id", None)
+        except Exception:
+            return None
+
     def handle_message(self, message: str, phone: str, name: str | None, wa_msg_id: str | None):
         """
         Entrada principal. Mantengo el flujo original y sólo adapto el scheduling.
         """
-        user = CustomerService.find_or_create(phone, name)
-        self.current_customer_id = user.get("id")
+        cid = self.correlation_id_provider()
+        self.logger.info(f"[CID={cid}] handle_message → phone={phone}, wa_msg_id={wa_msg_id}")
+        
+        user = CustomerService.find_or_create(phone, name, repo_provider=self.repo)
+        # En Dynamo no hay customer_id numérico, guardamos None para compatibilidad
+        self.current_customer_id = None
         self.current_phone = phone
         self.current_name = name
         self.current_wa_msg_id = wa_msg_id  # Para idempotencia en schedule_meeting
@@ -197,15 +219,16 @@ class Orchestrator:
         """
         # --- Contexto base ---
         wa_phone = wa_id
-        correlation_id = getattr(current_app, "correlation_id", None)
+        correlation_id = self._safe_current_cid() or self.correlation_id_provider()
         wa_msg_id = wa_msg_id or os.getenv("CURRENT_WAMID")
 
         # --- Obtener/crear AssistantConversation y recuperar last_response_id ---
         assistant_conv = AssistantConversationService.find_or_create(
             wa_phone=wa_phone,
-            customer_id=self.current_customer_id
+            customer_id=None,  # Dynamo no usa customer_id
+            repo_provider=self.repo
         )
-        previous_response_id = assistant_conv.last_response_id
+        previous_response_id = assistant_conv.get('last_response_id')
         
         # Tools (de tu catálogo). Asegurate que esta función devuelva la lista (no el dict raíz)
         tools = self._load_tools_catalog()
@@ -216,20 +239,14 @@ class Orchestrator:
         now = datetime.now(ZoneInfo(current_app.config.get("TZ", "America/Montevideo")))
         extra_instr = (
             f"\n\n[Instrucciones de runtime]\n"
-            f"- El usuario se llama: {user_name or 'Usuario'}.\n"
-            f"- Fecha/Hora actual: {now.strftime('%Y-%m-%d %H:%M')} ({now.tzinfo})\n"
-            f"- Usá SIEMPRE esta zona horaria para interpretar/mostrar horarios.\n"
-            f"- Sé DIRECTO: no repreguntes, no confirmes, no pidas datos obvios.\n"
-            f"- Asumí por defecto que el turno es presencial, de 60 minutos, con Karina y para el usuario.\n"
-            f"- Si falta un dato, asumilo sin frenar el flujo. Nunca respondas con una lista de preguntas.\n"
-            f"- Tu objetivo es RESOLVER en la primera respuesta. No digas frases genéricas como 'puedo ayudarte con...'.\n"
-            f"- Contestá en tono humano y natural, como un mensaje de WhatsApp breve.\n"
-            f"- Evitá saludos y repeticiones innecesarias. Prioridad: ACCIÓN inmediata.\n"
-            f"- Si el usuario pide disponibilidad → mostrá los horarios.\n"
-            f"- Si el usuario pide agendar → agendá directo.\n"
-            f"- Si el usuario pide cancelar → cancelá directo.\n"
-            f"- Si el usuario pide reprogramar → ofrecé nuevos horarios sin más.\n"
-            f"- Nunca preguntes: '¿Es con Karina?', '¿A nombre de quién?', '¿Qué tipo de turno?', '¿Cuánto dura?'.\n"
+            f"- Usuario: {user_name or 'Usuario'}.\n"
+            f"- Fecha/Hora: {now.strftime('%Y-%m-%d %H:%M')} ({now.tzinfo}). Usá SIEMPRE esta zona horaria.\n"
+            f"- Sé directo: resolvé sin rodeos ni repreguntas.\n"
+            f"- Por defecto: turno presencial, 60 min, con Karina y para quien escribe.\n"
+            f"- Si falta un dato, asumilo; no hagas listas de preguntas.\n"
+            f"- Estilo WhatsApp: breve, natural y orientado a la acción.\n"
+            f"- Disponibilidad → mostrar horarios. Agendar → reservar. Cancelar → eliminar. Reprogramar → ofrecer nuevos.\n"
+            f"- No preguntes por modalidad, nombre o duración.\n"
             f"- Stage: {current_app.config.get('STAGE','local')}\n"
         )
         instructions = base_instr + extra_instr
@@ -240,8 +257,6 @@ class Orchestrator:
         
         # Feature flag to disable parallel tool calls for compatibility
         disable_parallel = os.getenv("DISABLE_PARALLEL_TOOL_CALLS", "true").lower() in ("1", "true", "yes")
-        if disable_parallel:
-            current_app.logger.info("[RESP] parallel_tool_calls disabled")
         
         # Initial input messages
         input_messages = [{
@@ -249,17 +264,8 @@ class Orchestrator:
             "content": [{"type": "input_text", "text": user_msg}]
         }]
         
-        current_app.logger.info(
-            "[ORCH] First response call - correlation_id=%s wa_id=%s wa_msg_id=%s previous_response_id=%s",
-            correlation_id, wa_phone, wa_msg_id, previous_response_id
-        )
-        
         # Si existe previous_response_id, usar continuación; sino, crear primera respuesta
         if previous_response_id:
-            current_app.logger.info(
-                "[ORCH] Continuing conversation with previous_response_id=%s",
-                previous_response_id
-            )
             resp = continue_with_tool_output(
                 model=current_app.config["OPENAI_MODEL"],
                 previous_response_id=previous_response_id,
@@ -270,10 +276,9 @@ class Orchestrator:
                 store=True,
                 metadata={"wa_id": wa_phone, "wa_msg_id": wa_msg_id, "correlation_id": correlation_id},
                 idempotency_key=first_idem,
-                parallel_tool_calls=False if disable_parallel else None,  # ADDED: Always pass parallel setting
+                parallel_tool_calls=False if disable_parallel else None,
             )
         else:
-            current_app.logger.info("[ORCH] Creating first response (no previous_response_id)")
             resp = create_first_response(
                 model=current_app.config["OPENAI_MODEL"],
                 instructions=instructions,
@@ -287,14 +292,14 @@ class Orchestrator:
             )
 
         first_response_id = getattr(resp, "id", None)
-        current_app.logger.info(
-            "[ORCH] First response.id=%s correlation_id=%s",
-            first_response_id, correlation_id
-        )
         
         # --- Persistir response_id en la BD ---
         if first_response_id:
-            AssistantConversationService.update_last_response_id(wa_phone, first_response_id)
+            AssistantConversationService.update_last_response_id(
+                wa_phone, 
+                first_response_id, 
+                repo_provider=self.repo
+            )
 
         # --- 2) Loop: ejecutar tools y encadenar SOLO con previous_response_id ---
         max_iterations = 10  # Safety limit
@@ -320,28 +325,9 @@ class Orchestrator:
                 getattr(c, "call_id", None) or getattr(c, "id", None) or getattr(c, "tool_call_id", None)
                 for c in (tool_calls or [])
             ]
-            current_app.logger.debug(
-                "[TOOL] iter=%d detected=%d ids=%s",
-                iteration, len(tool_calls or []), ids_detectadas
-            )
 
             if not tool_calls:
                 # No hay más tools → tenemos respuesta final
-                try:
-                    out_items = getattr(resp, "output", []) or []
-                    msg_types = []
-                    for it in out_items:
-                        t = getattr(it, "type", None)
-                        if t == "message":
-                            msg_types.extend([getattr(p, "type", None) for p in (getattr(it, "content", []) or [])])
-                    current_app.logger.debug(
-                        "[RESP] no tool calls found. resp.id=%s out_types=%s message.part.types=%s",
-                        getattr(resp, "id", None),
-                        [getattr(i, "type", None) for i in out_items],
-                        msg_types,
-                    )
-                except Exception:
-                    pass
                 break
 
             # 3) Ejecutar cada tool-call y construir outputs
@@ -384,26 +370,14 @@ class Orchestrator:
                 # Ejecutar servicio real (GCal/DB/etc.) con manejo de errores
                 try:
                     result = self._dispatch_tool(tool_name, tool_args)
-                    current_app.logger.info(
-                        "[TOOL] %s ejecutada → call_id=%s result_type=%s",
-                        tool_name, call_id, type(result).__name__
-                    )
                     if result is None:
-                        current_app.logger.warning(
-                            "[TOOL] %s devolvió None, usando dict vacío", 
-                            tool_name
-                        )
                         result = {}
                 except Exception as e:
-                    current_app.logger.exception("[TOOL] %s falló", tool_name)
+                    current_app.logger.exception("[TOOL] %s failed", tool_name)
                     result = {"ok": False, "error": str(e)}
 
                 # CRÍTICO: Serialize output as JSON STRING per Responses API contract
                 out_str = json.dumps(result if result is not None else {}, ensure_ascii=False)
-                current_app.logger.info(
-                    "[TOOL] %s → call_id=%s output_len=%d",
-                    tool_name, call_id, len(out_str)
-                )
                 
                 # Agregar function_call_output con call_id y JSON string
                 tool_outputs.append(
@@ -412,19 +386,12 @@ class Orchestrator:
 
             # Validación: asegurar que agregamos outputs
             if not tool_outputs:
-                current_app.logger.warning(
-                    "[CONT] no se generaron outputs válidos; corto el loop para evitar bucles."
-                )
+                current_app.logger.warning("[CONT] no outputs; breaking to avoid loop")
                 break
 
             # 4) Enviar continuation con previous_response_id (SOLO previous_response_id)
             turn_index += 1
             follow_idem = f"resp::{wa_msg_id or 'none'}::follow::{first_response_id}::n{turn_index}"
-            
-            current_app.logger.info(
-                "[CONT] sending continuation prev_id=%s turn=%d outputs=%d correlation_id=%s",
-                first_response_id, turn_index, len(tool_outputs), correlation_id
-            )
             
             resp = continue_with_tool_output(
                 model=current_app.config["OPENAI_MODEL"],  # REQUIRED en continuación
@@ -439,31 +406,23 @@ class Orchestrator:
                 parallel_tool_calls=False if disable_parallel else None,  # ADDED: Always pass parallel setting
             )
             
-            current_app.logger.debug(
-                "[CONT] response.id=%s status=%s",
-                getattr(resp, "id", None), getattr(resp, "status", None),
-            )
-            
             if not resp:
-                current_app.logger.error(
-                    "[CONT] continuation failed; breaking to avoid loop."
-                )
+                current_app.logger.error("[CONT] continuation failed; breaking")
                 break
             
             # --- Persistir response_id actualizado en la BD ---
             continuation_response_id = getattr(resp, "id", None)
             if continuation_response_id:
-                AssistantConversationService.update_last_response_id(wa_phone, continuation_response_id)
+                AssistantConversationService.update_last_response_id(
+                    wa_phone, 
+                    continuation_response_id, 
+                    repo_provider=self.repo
+                )
                 # Actualizar first_response_id para siguientes continuaciones
                 first_response_id = continuation_response_id
 
         # --- 3) Texto final ---
         final_text = getattr(resp, "output_text", None) or self._render_text(getattr(resp, "output", []))
-        
-        current_app.logger.info(
-            "[ORCH] Final output length=%d correlation_id=%s first_response_id=%s",
-            len(final_text or ""), correlation_id, first_response_id
-        )
         
         return final_text
 
@@ -522,34 +481,52 @@ class Orchestrator:
     # ------------------------------------------------------------------
 
     def create_reminder(self, date: str, title: str, wa_msg_id: str | None = None) -> dict:
-            print(f"[DEBUG] Orchestrator.reminder → customer_id={self.current_customer_id}, date={date}, title={title}, wa_msg_id={wa_msg_id}")
+            import uuid
+            from app.db.dynamo_client import now_ms
             
-            # 1) Parsear la fecha a datetime
+            # 1) Parsear la fecha a datetime y convertir a epoch_ms
             reminder_dt = parse_iso8601(date)
+            date_ms = int(reminder_dt.timestamp() * 1000)
             
-            # 2) Crear reminder directamente en BD
-            reminder = Reminder(
-                customer_id=self.current_customer_id,
-                titulo=title,
-                date=reminder_dt,
-                wa_msg_id=wa_msg_id
+            # 2) Crear reminder en Dynamo
+            reminder_uuid = str(uuid.uuid4())
+            data = {
+                'titulo': title,
+                'wa_msg_id': wa_msg_id
+            }
+            
+            reminder = self.repo.reminders.create(
+                phone=self.current_phone,
+                date_ms=date_ms,
+                uuid=reminder_uuid,
+                data=data
             )
-            db.session.add(reminder)
-            db.session.commit()
             
             # 3) Programar el job de recordatorio (EventBridge)
             advance = current_app.config.get("EVENT_ADVANCE", timedelta(minutes=1))
             scheduler_service.schedule_event_reminder(
-                reminder.id,
+                reminder.get('reminder_id'),
                 advance=advance
             )
 
             # Devolvemos también title y date para templates
             date_str = reminder_dt.strftime("%Y-%m-%d %H:%M")
-            return {"reminder_id": reminder.id, "date": date_str, "title": title, "wa_msg_id": wa_msg_id}
+            return {
+                "reminder_id": reminder.get('reminder_id'),
+                "date": date_str,
+                "title": title,
+                "wa_msg_id": wa_msg_id
+            }
 
     def lookup_customer(self, customer_id: int) -> dict:
-            customer = CustomerService.get(customer_id)
+            """
+            DEPRECADO en Dynamo: customer_id no existe.
+            Retorna info del customer actual por phone.
+            """
+            if not self.current_phone:
+                return {"error": "no_phone", "customer": None}
+            
+            customer = CustomerService.get_by_phone(self.current_phone, repo_provider=self.repo)
             return {"customer": customer}
         
         
@@ -563,24 +540,25 @@ class Orchestrator:
         botón «Cancelar».  Usamos `context_id` (v16-) o, como *fallback*,
         `wa_msg_id`.
         """
-        # 1) Buscar el cliente
+        from app.db.dynamo_keys import pk_customer
+        
         target_msg_id = context_id or wa_msg_id
         if not target_msg_id:
-            return False        
-        customer = Customer.query.filter_by(phone=phone_id).first()
-        if not customer:
             return False
 
-        reminder = (
-            Reminder.query
-            .filter_by(customer_id=customer.id, wa_msg_id=target_msg_id)
-            .first()
-        )
+        # Buscar reminder por wa_msg_id
+        reminder = self.repo.reminders.get_by_wa_msg_id(target_msg_id)
         if not reminder:
             return False
 
-        db.session.delete(reminder)
-        db.session.commit()
+        # Verificar que pertenece al customer correcto
+        if reminder.get('customer_phone') != phone_id:
+            return False
+
+        # Eliminar reminder
+        key = {'pk': reminder['pk'], 'sk': reminder['sk']}
+        self.repo.reminders.delete_conditional(key)
+        
         return True
     
     def cancel_meeting(self,
@@ -589,112 +567,136 @@ class Orchestrator:
                       cancel_reason: str | None = None) -> dict:
         """
         Cancela una cita: marca appointment.status='canceled', cancela en Google Calendar,
-        elimina reminder asociado, y envía confirmación por WhatsApp.
+        y envía confirmación por WhatsApp.
         """
-        from app.models import Appointment, Reminder
+        from datetime import datetime, timezone
+        from app.db.dynamo_client import now_ms
         
         # Buscar appointment
         appt = None
-        if appointment_id:
-            appt = Appointment.query.get(appointment_id)
-        elif google_event_id:
-            appt = Appointment.query.filter_by(google_event_id=google_event_id).first()
+        if google_event_id:
+            appt = self.repo.appointments.get_by_google_event_id(google_event_id)
+        elif appointment_id:
+            # appointment_id en Dynamo es el UUID, buscar por phone + uuid
+            # Como no tenemos acceso directo, usamos google_event_id principalmente
+            return {"error": "use_google_event_id", "message": "Usar google_event_id para cancelar."}
         
         if not appt:
-            current_app.logger.warning("[CANCEL_MEETING] Appointment no encontrado")
             return {"error": "appointment_not_found", "message": "No encontré esa cita."}
         
-        if appt.status == 'canceled':
-            current_app.logger.info("[CANCEL_MEETING] Appointment ya estaba cancelado: id=%s", appt.id)
+        if appt.get('status') == 'canceled':
             return {"message": "Esta cita ya estaba cancelada."}
         
         try:
             # 1) Marcar como cancelado en BD
-            appt.status = 'canceled'
+            key = {'pk': appt['pk'], 'sk': appt['sk']}
+            update_expr = 'SET #st = :st, #rs = :rs, #ua = :ua'
+            expr_attr_names = {
+                '#st': 'status',
+                '#rs': 'reminder_status',
+                '#ua': 'updated_at'
+            }
+            expr_attr_values = {
+                ':st': 'canceled',
+                ':rs': 'skipped',
+                ':ua': now_ms()
+            }
+            
             if cancel_reason:
-                appt.cancel_reason = cancel_reason
-            if appt.reminder_status == 'pending':
-                appt.reminder_status = 'skipped'
+                update_expr += ', #cr = :cr'
+                expr_attr_names['#cr'] = 'cancel_reason'
+                expr_attr_values[':cr'] = cancel_reason
+            
+            updated_appt = self.repo.appointments.update_conditional(
+                key=key,
+                update_expr=update_expr,
+                expr_attr_names=expr_attr_names,
+                expr_attr_values=expr_attr_values
+            )
             
             # 2) Cancelar en Google Calendar
-            if appt.google_event_id:
+            if appt.get('google_event_id'):
                 try:
                     self.calendar_api.cancel_event(
-                        event_id=appt.google_event_id,
-                        calendar_id=appt.google_calendar_id
+                        event_id=appt['google_event_id'],
+                        calendar_id=appt.get('google_calendar_id')
                     )
-                    current_app.logger.info("[CANCEL_MEETING] Evento cancelado en Google: %s", appt.google_event_id)
                 except Exception:
-                    current_app.logger.exception("[CANCEL_MEETING] Error cancelando en Google Calendar")
+                    self.logger.exception("Error canceling in Google Calendar")
             
-            # 3) Eliminar reminder asociado
-            reminder = Reminder.query.filter_by(appointment_id=appt.id).first()
-            if reminder:
-                db.session.delete(reminder)
-                current_app.logger.info("[CANCEL_MEETING] Reminder eliminado: id=%s", reminder.id)
-            
-            db.session.commit()
-            
-            # 4) Enviar confirmación por WhatsApp
-            if appt.customer_id:
+            # 3) Enviar confirmación por WhatsApp
+            customer_phone = appt.get('customer_phone')
+            if customer_phone:
                 try:
-                    customer = Customer.query.get(appt.customer_id)
-                    if customer and customer.phone:
-                        from app.utils.whatsapp_utils import send_message, get_text_message_input
-                        cancel_text = (
-                            f"❌ Tu cita ha sido cancelada:\n\n"
-                            f"📅 {appt.starts_at.strftime('%d/%m/%Y %H:%M')}\n"
-                            f"📝 {appt.title}"
+                    from app.utils.whatsapp_utils import send_message, get_text_message_input
+                    
+                    # Convertir epoch_ms a datetime para formateo
+                    starts_at_ms = appt.get('starts_at_epoch')
+                    starts_dt = datetime.fromtimestamp(starts_at_ms / 1000, tz=timezone.utc)
+                    
+                    cancel_text = (
+                        f"❌ Tu cita ha sido cancelada:\n\n"
+                        f"📅 {starts_dt.strftime('%d/%m/%Y %H:%M')}\n"
+                        f"📝 {appt.get('title', 'Cita')}"
+                    )
+                    if cancel_reason:
+                        cancel_text += f"\n\nMotivo: {cancel_reason}"
+                    
+                    wa_response = send_message(get_text_message_input(customer_phone, cancel_text))
+                    if wa_response and "messages" in wa_response:
+                        # Actualizar cancel_confirm_wa_msg_id
+                        confirm_msg_id = wa_response["messages"][0]["id"]
+                        self.repo.appointments.update_conditional(
+                            key=key,
+                            update_expr='SET #ccid = :ccid',
+                            expr_attr_names={'#ccid': 'cancel_confirm_wa_msg_id'},
+                            expr_attr_values={':ccid': confirm_msg_id}
                         )
-                        if cancel_reason:
-                            cancel_text += f"\n\nMotivo: {cancel_reason}"
-                        
-                        wa_response = send_message(get_text_message_input(customer.phone, cancel_text))
-                        if wa_response and "messages" in wa_response:
-                            appt.cancel_confirm_wa_msg_id = wa_response["messages"][0]["id"]
-                            db.session.commit()
                 except Exception:
-                    current_app.logger.exception("[CANCEL_MEETING] Error enviando confirmación por WhatsApp")
+                    self.logger.exception("Error sending WhatsApp confirmation")
             
-            current_app.logger.info("[CANCEL_MEETING] Appointment cancelado exitosamente: id=%s", appt.id)
-            return {"appointment_id": appt.id, "message": "Cita cancelada exitosamente."}
+            return {
+                "appointment_id": appt.get('appointment_id'),
+                "message": "Cita cancelada exitosamente."
+            }
             
         except Exception as exc:
-            current_app.logger.exception("[CANCEL_MEETING] Error cancelando appointment")
-            db.session.rollback()
+            self.logger.exception("cancel_meeting error")
             return {"error": str(exc)}
     
     def list_upcoming_appointments(self, customer_id: int | None = None) -> list:
         """
         Lista las próximas citas de un cliente (status='scheduled' AND starts_at >= now).
         """
-        from app.models import Appointment
         from datetime import datetime, timezone
+        from app.db.dynamo_client import now_ms
         
-        cust_id = customer_id or self.current_customer_id
-        if not cust_id:
-            current_app.logger.warning("[LIST_APPOINTMENTS] No customer_id disponible")
+        # En Dynamo no usamos customer_id numérico, usamos phone
+        phone = self.current_phone
+        if not phone:
             return []
         
-        now_utc = datetime.now(timezone.utc)
-        appointments = (
-            Appointment.query
-            .filter_by(customer_id=cust_id, status='scheduled')
-            .filter(Appointment.starts_at >= now_utc)
-            .order_by(Appointment.starts_at.asc())
-            .all()
+        now_epoch = now_ms()
+        appointments = self.repo.appointments.list_upcoming_by_customer(
+            phone=phone,
+            now_ms=now_epoch,
+            limit=50
         )
         
         result = []
         for appt in appointments:
+            # Adaptar formato Dynamo a formato esperado
+            starts_ms = appt.get('starts_at_epoch')
+            ends_ms = appt.get('ends_at_epoch')
+            
             result.append({
-                "appointment_id": appt.id,
-                "title": appt.title,
-                "starts_at": appt.starts_at.isoformat(),
-                "ends_at": appt.ends_at.isoformat(),
-                "description": appt.description,
-                "google_event_id": appt.google_event_id,
-                "google_meet_link": appt.google_meet_link
+                "appointment_id": appt.get('appointment_id'),
+                "title": appt.get('title'),
+                "starts_at": datetime.fromtimestamp(starts_ms / 1000, tz=timezone.utc).isoformat(),
+                "ends_at": datetime.fromtimestamp(ends_ms / 1000, tz=timezone.utc).isoformat(),
+                "description": appt.get('description', ''),
+                "google_event_id": appt.get('google_event_id'),
+                "google_meet_link": appt.get('google_meet_link')
             })
         
         return result
@@ -709,7 +711,6 @@ class Orchestrator:
 
     # ------------------------------------------------------------------
     # Calendario: disponibilidad + agendado en GCal
-    # ------------------------------------------------------------------
     def schedule_meeting(self,
                          date: str,
                          duration_minutes: int = 60,
@@ -719,44 +720,43 @@ class Orchestrator:
         """
         Reserva slot en el Calendar si está libre, crea Appointment, y envía confirmación por WhatsApp.
         """
-        current_app.logger.info("[TOOL] schedule_meeting: date=%s, duration=%d, user=%s",
-                    date, duration_minutes, self.current_phone)
+        import uuid
+        from datetime import datetime, timezone
+        from zoneinfo import ZoneInfo
+        from app.config.settings import SETTINGS
+        from app.db.dynamo_client import now_ms
 
         # Estandarizar título con nombre desde DB (ignorar el 'title' libre)
         db_name = None
         try:
-            if self.current_customer_id:
-                cust = CustomerService.get(self.current_customer_id) or {}
-                db_name = cust.get("name")
-            if not db_name and self.current_phone:
-                c = Customer.query.filter_by(phone=self.current_phone).first()
-                db_name = getattr(c, "name", None)
+            if self.current_phone:
+                cust = CustomerService.get_by_phone(self.current_phone, repo_provider=self.repo)
+                db_name = cust.get("name") if not cust.get("error") else None
         except Exception:
             db_name = None
         customer_name = db_name or (self.current_name or "Usuario")
         event_title = f"Reunión con {customer_name}"
         
         if not self.has_calendar:
-            current_app.logger.error("[APPOINTMENT] Calendar service not initialized")
+            self.logger.error("Calendar service not initialized")
             raise RuntimeError("Servicio de calendario no disponible")
+        
         try:
             # 0) Customer actual
-            wa_id_var = getattr(self, "current_phone", None)
+            wa_id_var = self.current_phone
+            if not wa_id_var:
+                return {"error": "phone_required", "message": "No pude identificar tu número."}
             
             # Idempotencia: verificar si ya existe appointment con este intent_wa_msg_id
             if intent_wa_msg_id:
-                from app.models import Appointment
-                existing = Appointment.query.filter_by(
-                    intent_wa_msg_id=intent_wa_msg_id,
-                    status='scheduled'
-                ).first()
-                if existing:
-                    current_app.logger.info("[APPOINTMENT] Appointment ya existe (idempotencia): id=%s", existing.id)
+                existing = self.repo.appointments._get_by_intent_wa_msg_id(intent_wa_msg_id)
+                if existing and existing.get('status') == 'scheduled':
+                    starts_ms = existing.get('starts_at_epoch')
                     return {
-                        "appointment_id": existing.id,
-                        "event_id": existing.google_event_id,
-                        "date": existing.starts_at.isoformat(),
-                        "title": existing.title,
+                        "appointment_id": existing.get('appointment_id'),
+                        "event_id": existing.get('google_event_id'),
+                        "date": datetime.fromtimestamp(starts_ms / 1000, tz=timezone.utc).isoformat(),
+                        "title": existing.get('title'),
                         "message": "Tu cita ya estaba agendada."
                     }
 
@@ -781,64 +781,44 @@ class Orchestrator:
                 wa_id=wa_id_var,
                 calendar_id=calendar_id,
             )
-            current_app.logger.info("[TOOL] schedule_meeting calendar ok wa_id=%s event_id=%s", 
-                                  wa_id_var, cal_result["event_id"])
 
-            # 3) Crear Appointment en BD
-            from app.models import Appointment, Reminder
-            from datetime import datetime, timezone
-            from zoneinfo import ZoneInfo
-            from app.config.settings import SETTINGS
-            
+            # 3) Crear Appointment en Dynamo
             local_tz = ZoneInfo(SETTINGS.TZ)
             starts_at = datetime.fromisoformat(cal_result["start_dt"]).replace(tzinfo=local_tz)
             ends_at = datetime.fromisoformat(cal_result["end_dt"]).replace(tzinfo=local_tz)
             
-            # Obtener customer_id
-            customer_id = self.current_customer_id
-            if not customer_id and wa_id_var:
-                cust = Customer.query.filter_by(phone=wa_id_var).first()
-                customer_id = cust.id if cust else None
+            starts_at_utc = starts_at.astimezone(timezone.utc)
+            ends_at_utc = ends_at.astimezone(timezone.utc)
+            starts_at_ms = int(starts_at_utc.timestamp() * 1000)
+            ends_at_ms = int(ends_at_utc.timestamp() * 1000)
             
-            if not customer_id:
-                current_app.logger.error("[APPOINTMENT] No customer_id disponible para crear appointment")
-                return {"error": "customer_not_found", "message": "No pude identificar tu cuenta."}
+            # Crear UUID para el appointment
+            appt_uuid = str(uuid.uuid4())
             
-            # Crear appointment
-            appt = Appointment(
-                customer_id=customer_id,
-                title=event_title,
-                description=f"Reunión agendada vía WhatsApp con {customer_name}",
-                starts_at=starts_at.astimezone(timezone.utc),
-                ends_at=ends_at.astimezone(timezone.utc),
-                timezone=str(local_tz),
-                status='scheduled',
-                google_calendar_id=cal_result.get("calendar_id"),
-                google_event_id=cal_result["event_id"],
-                google_meet_link=cal_result.get("meet_link"),
-                remind_before_min=SETTINGS.EVENT_ADVANCE_MINUTES,
-                reminder_status='pending',
-                source='wa',
+            # Data para appointment
+            appt_data = {
+                'title': event_title,
+                'description': f"Reunión agendada vía WhatsApp con {customer_name}",
+                'ends_at': ends_at_ms,
+                'timezone': str(local_tz),
+                'status': 'scheduled',
+                'google_calendar_id': cal_result.get("calendar_id"),
+                'google_event_id': cal_result["event_id"],
+                'google_meet_link': cal_result.get("meet_link"),
+                'remind_before_min': SETTINGS.EVENT_ADVANCE_MINUTES,
+                'reminder_status': 'pending',
+                'source': 'wa'
+            }
+            
+            appt = self.repo.appointments.create_if_absent(
+                phone=wa_id_var,
+                starts_at_ms=starts_at_ms,
+                uuid=appt_uuid,
+                data=appt_data,
                 intent_wa_msg_id=intent_wa_msg_id
             )
             
-            # Calcular remind_at
-            appt.remind_at = appt.starts_at - timedelta(minutes=appt.remind_before_min)
-            
-            db.session.add(appt)
-            db.session.flush()  # Para obtener appt.id
-            
-            # 4) Crear reminder vinculado
-            reminder = Reminder(
-                customer_id=customer_id,
-                titulo=f"Recordatorio: {event_title}",
-                date=appt.remind_at,
-                appointment_id=appt.id
-            )
-            db.session.add(reminder)
-            db.session.commit()
-            
-            # 5) Enviar confirmación por WhatsApp
+            # 4) Enviar confirmación por WhatsApp
             from app.utils.whatsapp_utils import send_message, get_text_message_input
             confirm_text = (
                 f"✅ Listo! Tu cita está agendada:\n\n"
@@ -853,16 +833,20 @@ class Orchestrator:
             try:
                 wa_response = send_message(get_text_message_input(wa_id_var, confirm_text))
                 if wa_response and "messages" in wa_response:
-                    appt.confirm_wa_msg_id = wa_response["messages"][0]["id"]
-                    db.session.commit()
+                    confirm_msg_id = wa_response["messages"][0]["id"]
+                    # Actualizar confirm_wa_msg_id
+                    key = {'pk': appt['pk'], 'sk': appt['sk']}
+                    self.repo.appointments.update_conditional(
+                        key=key,
+                        update_expr='SET #cid = :cid',
+                        expr_attr_names={'#cid': 'confirm_wa_msg_id'},
+                        expr_attr_values={':cid': confirm_msg_id}
+                    )
             except Exception:
-                current_app.logger.exception("[APPOINTMENT] Error enviando confirmación por WhatsApp")
-            
-            current_app.logger.info("[APPOINTMENT] Created appointment id=%s, reminder id=%s", 
-                                  appt.id, reminder.id)
+                self.logger.exception("Error sending WhatsApp confirmation")
 
             return {
-                "appointment_id": appt.id,
+                "appointment_id": appt.get('appointment_id'),
                 "event_id": cal_result["event_id"],
                 "date": date,
                 "title": event_title,
@@ -870,8 +854,7 @@ class Orchestrator:
             }
 
         except Exception as exc:
-            logging.exception("[TOOL] schedule_meeting error")
-            db.session.rollback()
+            self.logger.exception("schedule_meeting error")
             return {"error": str(exc)}
         
     def check_availability(
@@ -886,12 +869,6 @@ class Orchestrator:
         Tool: devuelve bloques libres (del tamaño 'slot_minutes') en la fecha indicada.
         Usa el WAID del usuario actual para resolver calendario especial si aplica.
         """
-        current_app.logger.info("[APPOINTMENT] Checking availability: date=%s, start=%s, end=%s, duration=%d minutes, user=%s",
-                        date, start_time, end_time, slot_minutes, self.current_phone)
-        
-        if not self.has_calendar or not getattr(self.calendar_api, "get_free_slots", None):
-            current_app.logger.error("[APPOINTMENT] Calendar service unavailable")
-            return {"error": "calendar_unavailable"}
         if not self.has_calendar or not getattr(self.calendar_api, "get_free_slots", None):
             return {
                 "error": "calendar_unavailable",
@@ -907,15 +884,7 @@ class Orchestrator:
                 wa_id=wa_id,
                 calendar_id=calendar_id,
             )
-            out = {"slots": slots}
-            try:
-                current_app.logger.info(
-                    "[TOOL] check_availability OUTPUT=%s",
-                    json.dumps(out, ensure_ascii=False)
-                )
-            except Exception:
-                pass
-            return out
+            return {"slots": slots}
         except Exception as e:
             logging.exception("[check_availability] error")
             return {"error": "calendar_error", "message": str(e)}
@@ -958,10 +927,8 @@ class Orchestrator:
         - fecha_hora: string (natural o ISO) en horario de America/Montevideo, o None para envío inmediato.
         Devuelve lo que retorna _process_direct (string de error o "" si ok).
         """
-        from flask import current_app
         # 1) Normalizar fecha_hora -> datetime (o None)
         if fecha_hora:
-            current_app.logger.info(f"[Orchestrator] Enviando mensaje a {telefono} para {fecha_hora}")
             dt = dateparser.parse(
                 fecha_hora,
                 settings={
@@ -983,8 +950,6 @@ class Orchestrator:
 
         # 2) Normalizar teléfono y despachar
         to_e164 = self._to_e164_uy(telefono)
-        current_app.logger.info(f"[Orchestrator] Teléfono normalizado: {telefono} -> {to_e164}")
-        current_app.logger.info(f"[Orchestrator] Enviando mensaje a {to_e164} para {dt}")
         # 3) Reusar el flow existente para despachar
         return self.send_msg_flow._process_direct(
             origin_phone=getattr(self, "current_phone", None) or "",
@@ -1001,23 +966,52 @@ class Orchestrator:
                 context_id: str | None = None,
                 wa_msg_id: str | None = None
         ) -> bool:
+            """
+            Cancela un mensaje programado pendiente.
+            En Dynamo, buscamos por customer y filtramos por wa_msg_id de confirmación.
+            """
+            from app.db.dynamo_keys import pk_customer
+            from app.db.dynamo_client import now_ms
+            
             target_msg_id = context_id or wa_msg_id
             if not target_msg_id:
-                return False            # no hay referencia válida
-
-            customer = Customer.query.filter_by(phone=phone_id).first()
-            if not customer:
                 return False
 
-            sm = (ScheduledMessage.query
-                    .filter_by(customer_id=customer.id,
-                            wa_msg_id=target_msg_id,
-                            status="pending")
-                    .first())
-            if not sm:
-                return False
+            # Buscar mensajes programados del customer (status=pending)
+            # Como no hay GSI por wa_msg_id, necesitamos query por customer
+            try:
+                pending_messages = self.repo.scheduled_messages.query(
+                    key_condition_expr='#pk = :pk AND begins_with(#sk, :sk_prefix)',
+                    expr_attr_names={
+                        '#pk': 'pk',
+                        '#sk': 'sk',
+                        '#st': 'status'
+                    },
+                    expr_attr_values={
+                        ':pk': pk_customer(phone_id),
+                        ':sk_prefix': 'SM#',
+                        ':st': 'pending'
+                    },
+                    filter_expr='#st = :st',
+                    limit=100
+                )
+                
+                # Filtrar por wa_msg_id (mensaje de confirmación)
+                sm = None
+                for msg in pending_messages:
+                    if msg.get('wa_msg_id') == target_msg_id:
+                        sm = msg
+                        break
+                
+                if not sm:
+                    return False
 
-            # 2️⃣  eliminar la fila (mantiene tu patrón de `Reminder`)
-            db.session.delete(sm)
-            db.session.commit()
-            return True
+                # Eliminar el mensaje
+                key = {'pk': sm['pk'], 'sk': sm['sk']}
+                self.repo.scheduled_messages.delete_conditional(key)
+                
+                return True
+                
+            except Exception as e:
+                self.logger.exception("cancel_scheduled_message error")
+                return False
