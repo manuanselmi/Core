@@ -138,13 +138,19 @@ def _handle_scheduler_jobs(repo_provider: RepositoryProvider, correlation_id: st
         
         for appt in reminders:
             try:
-                phone = appt.get("phone")
+                # Validación defensiva: skipear items sin campos requeridos
+                phone = appt.get("customer_phone")
                 title = appt.get("title")
-                starts_at_ms = appt.get("starts_at_ms")
+                starts_at_ms = appt.get("starts_at_epoch")
+                pk = appt.get("pk")
+                sk = appt.get("sk")
                 
-                # Formatear fecha/hora
-                starts_dt = datetime.fromtimestamp(starts_at_ms / 1000, tz=timezone.utc)
-                starts_local = starts_dt.astimezone(APP.config.get("TZ") or timezone.utc)
+                if not all([phone, title, starts_at_ms, pk, sk]):
+                    logger.warning(
+                        "[CID=%s] [SCHEDULER] Skipping invalid reminder: phone=%s title=%s starts_at=%s pk=%s sk=%s",
+                        correlation_id, phone, bool(title), starts_at_ms, pk, sk
+                    )
+                    continue
                 
                 payload = get_event_reminder_template_input(
                     recipient=phone,
@@ -154,8 +160,6 @@ def _handle_scheduler_jobs(repo_provider: RepositoryProvider, correlation_id: st
                 sent_reminders += 1
                 
                 # Marcar como enviado (update reminder_status)
-                pk = appt.get("pk")
-                sk = appt.get("sk")
                 repo_provider.appointments.update_reminder_status(pk, sk, "sent")
             except Exception:
                 logger.exception("[CID=%s] [SCHEDULER] Error sending appointment reminder", correlation_id)

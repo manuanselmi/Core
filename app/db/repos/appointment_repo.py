@@ -268,14 +268,14 @@ class AppointmentRepo(DynamoRepoBase):
             Lista de citas con recordatorio pendiente ordenadas por remind_at
             
         Notes:
-            - Usa GSI ApptReminderQueue
-            - PK: reminder_status_status = "PENDING#SCHEDULED" (compuesto de reminder_status#status)
-            - SK: remind_at_epoch (<= now_ms)
-            - Solo retorna citas con status='scheduled' y reminder_status='pending'
+            - Usa GSI ApptReminderQueue para encontrar PKs
+            - Luego hace GetItem por cada PK/SK para obtener atributos completos
+            - Necesario porque el GSI puede no proyectar todos los atributos
         """
         from decimal import Decimal
         
-        return self.query(
+        # Query GSI para obtener PKs (puede retornar solo keys si ProjectionType != ALL)
+        sparse_items = self.query(
             key_condition_expr='#pk = :pk AND #sk <= :now',
             expr_attr_names={
                 '#pk': 'reminder_status_status',
@@ -289,6 +289,18 @@ class AppointmentRepo(DynamoRepoBase):
             scan_forward=True,
             limit=limit
         )
+        
+        # Fetch completo de cada item usando PK/SK real
+        full_items = []
+        for item in sparse_items:
+            pk = item.get('pk')
+            sk = item.get('sk')
+            if pk and sk:
+                full_item = self.get_item({'pk': pk, 'sk': sk})
+                if full_item:
+                    full_items.append(full_item)
+        
+        return full_items
     
     def get_by_google_event_id(self, google_event_id: str) -> dict | None:
         """

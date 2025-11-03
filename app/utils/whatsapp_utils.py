@@ -91,8 +91,8 @@ def get_event_reminder_template_input(
     titulo: str,
 ) -> dict:
     """
-    Payload para la plantilla 'recordatorio_24h' aprobada en Meta.
-    Body con 1 parámetro: título del evento.
+    Payload para la plantilla 'cita' aprobada en Meta.
+    Body con 1 parámetro: nombre/título del evento.
     """
     return {
         "messaging_product": "whatsapp",
@@ -100,8 +100,8 @@ def get_event_reminder_template_input(
         "to": recipient,
         "type": "template",
         "template": {
-            "name": "recordatorio_cita",          
-            "language": {"code": "es_AR"},
+            "name": "cita",          
+            "language": {"code": "en"},
             "components": [
                 {
                     "type": "body",
@@ -272,7 +272,7 @@ def send_message(payload: dict) -> dict:
     }
 
     logging.info(f"🚀 [send_message] Payload:\n{payload!r}")
-    resp = requests.post(url, json=payload, headers=headers, timeout=10)
+    resp = requests.post(url, json=payload, headers=headers, timeout=(5, 20))
     if resp.status_code != 200:
         logging.error(f"❌ [send_message] Error {resp.status_code}:\n{resp.text}")
     else:
