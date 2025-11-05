@@ -88,11 +88,16 @@ def get_recordatorio_template_input(
 
 def get_event_reminder_template_input(
     recipient: str,
-    titulo: str,
+    nombre_sesion: str,
+    fecha: str,
+    hora: str
 ) -> dict:
     """
-    Payload para la plantilla 'cita' aprobada en Meta.
-    Body con 1 parámetro: nombre/título del evento.
+    Payload para la plantilla 'service' aprobada en Meta.
+    Body con 3 parámetros:
+    - {{1}}: nombre de la sesión/título
+    - {{2}}: fecha
+    - {{3}}: hora
     """
     return {
         "messaging_product": "whatsapp",
@@ -100,13 +105,15 @@ def get_event_reminder_template_input(
         "to": recipient,
         "type": "template",
         "template": {
-            "name": "cita",          
-            "language": {"code": "en"},
+            "name": "servic",          
+            "language": {"code": "es_AR"},
             "components": [
                 {
                     "type": "body",
                     "parameters": [
-                        {"type": "text", "text": titulo},       # {{1}}
+                        {"type": "text", "text": nombre_sesion},  
+                        {"type": "text", "text": fecha},          
+                        {"type": "text", "text": hora},           
                     ],
                 }
             ],

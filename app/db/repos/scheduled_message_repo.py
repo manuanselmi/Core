@@ -191,3 +191,18 @@ class ScheduledMessageRepo(DynamoRepoBase):
                 ':wamid': wa_msg_id
             }
         )
+    
+    def delete_item(self, pk: str, sk: str) -> None:
+        """
+        Elimina un mensaje programado por su clave.
+        
+        Args:
+            pk: Partition key (CUST#<phone>)
+            sk: Sort key (SM#<send_at_ms>#<uuid>)
+            
+        Notes:
+            - Usado por el scheduler para eliminar mensajes inmediatamente después de enviarlos
+            - Previene reenvíos duplicados del mismo mensaje
+        """
+        key = {'pk': pk, 'sk': sk}
+        self.delete_conditional(key=key)

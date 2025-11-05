@@ -353,3 +353,151 @@ class AppointmentRepo(DynamoRepoBase):
             expr_attr_names={'#rs': 'reminder_status'},
             expr_attr_values={':status': new_status}
         )
+    
+    def claim_reminder(self, pk: str, sk: str, now_ms: int) -> dict | None:
+        """
+        Reclama un reminder de forma atómica cambiando status de 'pending' a 'sending'.
+        
+        Args:
+            pk: Partition key
+            sk: Sort key
+            now_ms: Timestamp actual en milisegundos
+        
+        Returns:
+            Dict con el item actualizado si claim exitoso, None si falla
+            
+        Notes:
+            - Condición: reminder_status='pending' (o 'sending' stale > 2 min)
+            - Setea claimed_at=now_ms
+        """
+        try:
+            # Intentar claim desde 'pending'
+            return self.update_conditional(
+                key={'pk': pk, 'sk': sk},
+                update_expr='SET #rs = :sending, claimed_at = :now',
+                condition_expr='#rs = :pending',
+                expr_attr_names={'#rs': 'reminder_status'},
+                expr_attr_values={
+                    ':sending': 'sending',
+                    ':pending': 'pending',
+                    ':now': now_ms
+                }
+            )
+        except ClientError as e:
+            if e.response['Error']['Code'] == 'ConditionalCheckFailedException':
+                # Intentar reclaim de 'sending' stale (> 2 min)
+                try:
+                    stale_threshold = now_ms - (2 * 60 * 1000)
+                    return self.update_conditional(
+                        key={'pk': pk, 'sk': sk},
+                        update_expr='SET claimed_at = :now',
+                        condition_expr='#rs = :sending AND claimed_at < :stale',
+                        expr_attr_names={'#rs': 'reminder_status'},
+                        expr_attr_values={
+                            ':sending': 'sending',
+                            ':now': now_ms,
+                            ':stale': stale_threshold
+                        }
+                    )
+                except ClientError:
+                    return None
+            raise
+    
+    def mark_reminder_sent(self, pk: str, sk: str, wa_msg_id: str, now_ms: int) -> dict:
+        """
+        Marca un reminder como enviado.
+        
+        Args:
+            pk: Partition key
+            sk: Sort key
+            wa_msg_id: WhatsApp message ID de la confirmación enviada
+            now_ms: Timestamp actual en milisegundos
+        
+        Returns:
+            Dict con el item actualizado
+        """
+        return self.update_conditional(
+            key={'pk': pk, 'sk': sk},
+            update_expr='SET #rs = :sent, reminder_sent_at = :now, last_reminder_wa_msg_id = :waid REMOVE claimed_at',
+            expr_attr_names={'#rs': 'reminder_status'},
+            expr_attr_values={
+                ':sent': 'sent',
+                ':now': now_ms,
+                ':waid': wa_msg_id
+            }
+        )
+    
+    def release_claim(self, pk: str, sk: str, error_msg: str | None = None) -> dict:
+        """
+        Libera un claim fallido volviendo a 'pending'.
+        
+        Args:
+            pk: Partition key
+            sk: Sort key
+            error_msg: Mensaje de error opcional
+        
+        Returns:
+            Dict con el item actualizado
+        """
+        update_expr = 'SET #rs = :pending REMOVE claimed_at'
+        expr_attr_values = {':pending': 'pending'}
+        
+        if error_msg:
+            update_expr = 'SET #rs = :pending, last_error = :err REMOVE claimed_at'
+            expr_attr_values[':err'] = error_msg
+        
+        return self.update_conditional(
+            key={'pk': pk, 'sk': sk},
+            update_expr=update_expr,
+            expr_attr_names={'#rs': 'reminder_status'},
+            expr_attr_values=expr_attr_values
+        )
+    
+    def expire_reminder(self, pk: str, sk: str, now_ms: int) -> dict:
+        """
+        Marca un reminder como expirado (fuera de ventana).
+        
+        Args:
+            pk: Partition key
+            sk: Sort key
+            now_ms: Timestamp actual en milisegundos
+        
+        Returns:
+            Dict con el item actualizado
+        """
+        return self.update_conditional(
+            key={'pk': pk, 'sk': sk},
+            update_expr='SET #rs = :expired, expired_at = :now REMOVE claimed_at',
+            expr_attr_names={'#rs': 'reminder_status'},
+            expr_attr_values={
+                ':expired': 'expired',
+                ':now': now_ms
+            }
+        )
+    
+    def delete_reminder(self, pk: str, sk: str, now_ms: int) -> dict:
+        """
+        Elimina el recordatorio de un appointment (limpia campos de reminder).
+        
+        Args:
+            pk: Partition key
+            sk: Sort key
+            now_ms: Timestamp actual en milisegundos
+        
+        Returns:
+            Dict con el item actualizado
+            
+        Notes:
+            - Elimina remind_at_epoch, reminder_status, claimed_at, reminder_status_status
+            - Agrega reminder_deleted_at para registro informativo
+            - El appointment NO se borra, solo se elimina la información del recordatorio
+            - Esto previene que el scheduler vuelva a seleccionar este appointment
+        """
+        return self.update_conditional(
+            key={'pk': pk, 'sk': sk},
+            update_expr=(
+                'SET reminder_deleted_at = :now '
+                'REMOVE remind_at_epoch, reminder_status, claimed_at, reminder_status_status'
+            ),
+            expr_attr_values={':now': now_ms}
+        )

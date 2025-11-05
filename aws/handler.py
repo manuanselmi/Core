@@ -125,8 +125,14 @@ def _handle_scheduler_jobs(repo_provider: RepositoryProvider, correlation_id: st
                 resp = send_message(payload)
                 wa_msg_id = resp.get("messages", [{}])[0].get("id")
                 
-                repo_provider.scheduled_messages.mark_sent(pk, sk, wa_msg_id=wa_msg_id, at_ms=now_ms)
+                # BORRAR el mensaje inmediatamente después del envío exitoso
+                repo_provider.scheduled_messages.delete_item(pk, sk)
                 sent_messages += 1
+                
+                logger.info(
+                    "[CID=%s] [SCHEDULER] ScheduledMessage enviado y borrado: pk=%s sk=%s wa_msg_id=%s",
+                    correlation_id, pk, sk, wa_msg_id
+                )
             except Exception:
                 logger.exception("[CID=%s] [SCHEDULER] Error sending scheduled message", correlation_id)
     except Exception:
@@ -142,6 +148,7 @@ def _handle_scheduler_jobs(repo_provider: RepositoryProvider, correlation_id: st
                 phone = appt.get("customer_phone")
                 title = appt.get("title")
                 starts_at_ms = appt.get("starts_at_epoch")
+                timezone_name = appt.get("timezone", LOCAL_TZ)
                 pk = appt.get("pk")
                 sk = appt.get("sk")
                 
@@ -152,15 +159,29 @@ def _handle_scheduler_jobs(repo_provider: RepositoryProvider, correlation_id: st
                     )
                     continue
                 
+                # Formatear fecha y hora
+                from zoneinfo import ZoneInfo
+                tz = ZoneInfo(timezone_name)
+                dt = datetime.fromtimestamp(starts_at_ms / 1000, tz=tz)
+                fecha = dt.strftime("%d/%m/%Y")  # DD/MM/YYYY
+                hora = dt.strftime("%H:%M")      # HH:MM
+                
                 payload = get_event_reminder_template_input(
                     recipient=phone,
-                    titulo=title,
+                    nombre_sesion=title,
+                    fecha=fecha,
+                    hora=hora
                 )
                 send_message(payload)
                 sent_reminders += 1
                 
-                # Marcar como enviado (update reminder_status)
-                repo_provider.appointments.update_reminder_status(pk, sk, "sent")
+                # BORRAR el recordatorio inmediatamente después del envío exitoso
+                repo_provider.appointments.delete_reminder(pk, sk, now_ms)
+                
+                logger.info(
+                    "[CID=%s] [SCHEDULER] Recordatorio enviado y borrado: pk=%s sk=%s customer=%s",
+                    correlation_id, pk, sk, phone
+                )
             except Exception:
                 logger.exception("[CID=%s] [SCHEDULER] Error sending appointment reminder", correlation_id)
     except Exception:

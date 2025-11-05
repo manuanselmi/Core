@@ -94,6 +94,32 @@ def _now_ms() -> int:
     return int(_now_utc().timestamp() * 1000)
 
 
+def _format_datetime_for_reminder(epoch_ms: int, tz_name: str = None) -> tuple[str, str]:
+    """
+    Formatea un timestamp epoch_ms a fecha y hora separadas.
+    
+    Args:
+        epoch_ms: Timestamp en milisegundos (epoch UTC)
+        tz_name: Nombre de timezone (ej: 'America/Montevideo'). Si es None, usa LOCAL_TZ_NAME
+    
+    Returns:
+        Tupla (fecha, hora) formateadas para el recordatorio
+        Ejemplo: ("04/11/2025", "14:30")
+    """
+    if tz_name is None:
+        tz_name = LOCAL_TZ_NAME
+    
+    tz = ZoneInfo(tz_name)
+    dt = datetime.fromtimestamp(epoch_ms / 1000, tz=tz)
+    
+    # Formato: DD/MM/YYYY
+    fecha = dt.strftime("%d/%m/%Y")
+    # Formato: HH:MM
+    hora = dt.strftime("%H:%M")
+    
+    return (fecha, hora)
+
+
 # ────────────────────────────────────────────────────────────────────
 # API de programación (compat)
 # ────────────────────────────────────────────────────────────────────
@@ -161,12 +187,60 @@ def _claim_pending_scheduled_messages(repo: RepositoryProvider, now_ms: int, lim
 
 def _process_scheduled_messages(repo: RepositoryProvider, rows: list[dict], now_ms: int) -> int:
     """
-    Procesa mensajes programados reclamados: envía y marca como sent/error.
+    Procesa mensajes programados reclamados: envía y borra el item de la base.
+    
+    Notes:
+        - Ventana exacta: solo envía si now_ms está en [send_at_ms, send_at_ms + 60s)
+        - De-dup intra-tick: usa set con pk#sk para evitar duplicados en mismo barrido
+        - CAMBIO CRÍTICO: después de enviar exitosamente, se BORRA el item (no solo marca sent)
     """
     sent = 0
+    seen_keys = set()
+    
     for msg in rows:
         try:
-            # Enviar mensaje
+            # 1) De-dup intra-tick
+            key_str = f"{msg['pk']}#{msg['sk']}"
+            if key_str in seen_keys:
+                logging.debug("[SchedulerService] Duplicado intra-tick (SM): %s", key_str)
+                continue
+            seen_keys.add(key_str)
+            
+            # 2) Verificar ventana exacta (send_at_ms <= now_ms < send_at_ms + 60s)
+            send_at_ms = msg.get('send_at_epoch')
+            if not send_at_ms:
+                logging.warning("[SchedulerService] ScheduledMessage sin send_at_epoch: %s", msg)
+                continue
+            
+            window_end = send_at_ms + (60 * 1000)  # 60 segundos
+            
+            if now_ms < send_at_ms:
+                # Todavía no es tiempo (no debería pasar con query correcto)
+                logging.debug(
+                    "[SchedulerService] Mensaje antes de tiempo: sm=%s, now=%s, send_at=%s",
+                    msg.get('sm_id'), now_ms, send_at_ms
+                )
+                continue
+            
+            if now_ms >= window_end:
+                # Fuera de ventana: marcar expirado
+                logging.warning(
+                    "[SchedulerService] Mensaje fuera de ventana: sm=%s, now=%s, send_at=%s",
+                    msg.get('sm_id'), now_ms, send_at_ms
+                )
+                key = {'pk': msg['pk'], 'sk': msg['sk']}
+                repo.scheduled_messages.update_conditional(
+                    key=key,
+                    update_expr='SET #st = :expired, expired_at = :now REMOVE claimed_at',
+                    expr_attr_names={'#st': 'status'},
+                    expr_attr_values={
+                        ':expired': 'expired',
+                        ':now': now_ms
+                    }
+                )
+                continue
+            
+            # 3) Enviar mensaje
             target_phone = msg.get('target_phone')
             text = msg.get('text')
             
@@ -185,21 +259,28 @@ def _process_scheduled_messages(repo: RepositoryProvider, rows: list[dict], now_
                 message=text
             )
             
-            wa_msg_id = result.get('messages', [{}])[0].get('id', 'unknown')
+            # 4) Extraer wa_msg_id de la respuesta
+            wa_msg_id = 'unknown'
+            if result and 'messages' in result and len(result['messages']) > 0:
+                wa_msg_id = result['messages'][0].get('id', 'unknown')
             
-            # Marcar como sent
-            key = {'pk': msg['pk'], 'sk': msg['sk']}
-            repo.scheduled_messages.mark_sent(key=key, wa_msg_id=wa_msg_id, at_ms=now_ms)
+            # 5) BORRAR el item inmediatamente después del envío exitoso
+            repo.scheduled_messages.delete_item(pk=msg['pk'], sk=msg['sk'])
             sent += 1
+            
+            logging.info(
+                "[SchedulerService] ScheduledMessage enviado y borrado: sm=%s, target=%s, wa_msg_id=%s",
+                msg.get('sm_id'), target_phone, wa_msg_id
+            )
             
         except Exception:
             logging.exception("[SchedulerService] Error enviando ScheduledMessage: %s", msg)
-            # Marcar como error (si existe método mark_failed en repo)
+            # Marcar como error
             try:
                 key = {'pk': msg['pk'], 'sk': msg['sk']}
                 repo.scheduled_messages.update_conditional(
                     key=key,
-                    update_expr='SET #st = :error, error_at = :at',
+                    update_expr='SET #st = :error, error_at = :at REMOVE claimed_at',
                     expr_attr_names={'#st': 'status'},
                     expr_attr_values={':error': 'error', ':at': now_ms}
                 )
@@ -238,14 +319,21 @@ def _process_reminders(repo: RepositoryProvider, rows: list[dict]) -> int:
         try:
             phone = r.get('customer_phone')
             titulo = r.get('titulo')
+            remind_at_ms = r.get('remind_at_epoch')
+            tz_name = r.get('timezone', LOCAL_TZ_NAME)
             
-            if not phone or not titulo:
-                logging.warning("[SchedulerService] Reminder sin phone o titulo: %s", r)
+            if not phone or not titulo or not remind_at_ms:
+                logging.warning("[SchedulerService] Reminder sin phone, titulo o remind_at_epoch: %s", r)
                 continue
+            
+            # Formatear fecha y hora
+            fecha, hora = _format_datetime_for_reminder(remind_at_ms, tz_name)
             
             payload = get_event_reminder_template_input(
                 recipient=phone,
-                titulo=titulo,
+                nombre_sesion=titulo,
+                fecha=fecha,
+                hora=hora
             )
             send_message(payload)
             
@@ -265,11 +353,11 @@ def _claim_due_appointments(repo: RepositoryProvider, now_ms: int, limit: int) -
     Selecciona appointments con recordatorio pendiente usando DynamoDB GSI.
     
     Notes:
-        - Usa query_due_reminders() del appointment_repo
+        - Usa query_reminders_due() del appointment_repo
         - GSI ApptReminderQueue: PK='pending#scheduled', SK=remind_at_epoch
         - No requiere SKIP LOCKED porque DynamoDB es event-driven
     """
-    return repo.appointments.query_due_reminders(now_ms=now_ms, limit=limit)
+    return repo.appointments.query_reminders_due(now_ms=now_ms, limit=limit)
 
 
 def _process_appointments(repo: RepositoryProvider, rows: list[dict], now_ms: int) -> tuple[int, int, int]:
@@ -277,6 +365,12 @@ def _process_appointments(repo: RepositoryProvider, rows: list[dict], now_ms: in
     Procesa appointments para enviar recordatorios.
     Valida existencia del evento en Google Calendar antes de enviar.
     Retorna (sent, skipped, canceled_detected).
+    
+    Notes:
+        - Claim atómico: pending -> sending antes de enviar
+        - Ventana exacta: solo envía si now_ms está en [remind_at_ms, remind_at_ms + 60s)
+        - De-dup intra-tick: usa set con pk#sk para evitar duplicados en mismo barrido
+        - CAMBIO CRÍTICO: después de enviar exitosamente, se BORRA el recordatorio del appointment
     """
     from app.services.google_calendar_service import GoogleCalendarService
     from app.config.settings import SETTINGS
@@ -284,6 +378,9 @@ def _process_appointments(repo: RepositoryProvider, rows: list[dict], now_ms: in
     sent = 0
     skipped = 0
     canceled_detected = 0
+    
+    # De-dup intra-tick
+    seen_keys = set()
     
     try:
         gcal = GoogleCalendarService()
@@ -293,7 +390,60 @@ def _process_appointments(repo: RepositoryProvider, rows: list[dict], now_ms: in
     
     for appt in rows:
         try:
-            # Validar existencia del evento en Google Calendar
+            # 1) De-dup intra-tick
+            key_str = f"{appt['pk']}#{appt['sk']}"
+            if key_str in seen_keys:
+                logging.debug("[SchedulerService] Duplicado intra-tick: %s", key_str)
+                continue
+            seen_keys.add(key_str)
+            
+            # 2) Verificar ventana exacta (remind_at_ms <= now_ms < remind_at_ms + 60s)
+            remind_at_ms = appt.get('remind_at_epoch')
+            if not remind_at_ms:
+                logging.warning("[SchedulerService] Appointment sin remind_at_epoch: %s", appt)
+                skipped += 1
+                continue
+            
+            window_end = remind_at_ms + (60 * 1000)  # 60 segundos
+            
+            if now_ms < remind_at_ms:
+                # Todavía no es tiempo (no debería pasar con query correcto)
+                logging.debug(
+                    "[SchedulerService] Reminder antes de tiempo: appt=%s, now=%s, remind_at=%s",
+                    appt.get('appointment_id'), now_ms, remind_at_ms
+                )
+                skipped += 1
+                continue
+            
+            if now_ms >= window_end:
+                # Fuera de ventana: expirar
+                logging.warning(
+                    "[SchedulerService] Reminder fuera de ventana: appt=%s, now=%s, remind_at=%s",
+                    appt.get('appointment_id'), now_ms, remind_at_ms
+                )
+                repo.appointments.expire_reminder(
+                    pk=appt['pk'],
+                    sk=appt['sk'],
+                    now_ms=now_ms
+                )
+                skipped += 1
+                continue
+            
+            # 3) Claim atómico
+            claimed = repo.appointments.claim_reminder(
+                pk=appt['pk'],
+                sk=appt['sk'],
+                now_ms=now_ms
+            )
+            if not claimed:
+                logging.debug(
+                    "[SchedulerService] Claim fallido (ya reclamado): appt=%s",
+                    appt.get('appointment_id')
+                )
+                skipped += 1
+                continue
+            
+            # 4) Validar existencia del evento en Google Calendar
             google_event_id = appt.get('google_event_id')
             google_calendar_id = appt.get('google_calendar_id')
             
@@ -310,7 +460,7 @@ def _process_appointments(repo: RepositoryProvider, rows: list[dict], now_ms: in
                     key = {'pk': appt['pk'], 'sk': appt['sk']}
                     repo.appointments.update_conditional(
                         key=key,
-                        update_expr='SET #st = :canceled, #rs = :skipped, cancel_reason = :reason',
+                        update_expr='SET #st = :canceled, #rs = :skipped, cancel_reason = :reason REMOVE claimed_at',
                         expr_attr_names={'#st': 'status', '#rs': 'reminder_status'},
                         expr_attr_values={
                             ':canceled': 'canceled',
@@ -321,63 +471,74 @@ def _process_appointments(repo: RepositoryProvider, rows: list[dict], now_ms: in
                     canceled_detected += 1
                     continue
             
-            # Obtener customer phone
+            # 5) Obtener customer phone
             customer_phone = appt.get('customer_phone')
             if not customer_phone:
                 logging.warning("[SchedulerService] Appointment sin customer_phone: %s", appt)
-                key = {'pk': appt['pk'], 'sk': appt['sk']}
-                repo.appointments.update_reminder_status(
+                repo.appointments.release_claim(
                     pk=appt['pk'],
                     sk=appt['sk'],
-                    new_status='error'
+                    error_msg='Sin customer_phone'
                 )
+                skipped += 1
                 continue
             
-            # Construir mensaje de recordatorio
-            agent_name = SETTINGS.AGENT_NAME
-            titulo = f"Tenés turno con {agent_name} en una hora."
-            if appt.get('title'):
-                titulo = f"Recordatorio: {appt['title']}"
+            # 6) Construir mensaje de recordatorio
+            nombre_sesion = appt.get('title', 'Sesión')
+            starts_at_ms = appt.get('starts_at_epoch')
+            tz_name = appt.get('timezone', LOCAL_TZ_NAME)
             
-            # Enviar recordatorio
+            if not starts_at_ms:
+                logging.warning("[SchedulerService] Appointment sin starts_at_epoch: %s", appt)
+                repo.appointments.release_claim(
+                    pk=appt['pk'],
+                    sk=appt['sk'],
+                    error_msg='Sin starts_at_epoch'
+                )
+                skipped += 1
+                continue
+            
+            # Formatear fecha y hora del appointment
+            fecha, hora = _format_datetime_for_reminder(starts_at_ms, tz_name)
+            
+            # 7) Enviar recordatorio
             payload = get_event_reminder_template_input(
                 recipient=customer_phone,
-                titulo=titulo
+                nombre_sesion=nombre_sesion,
+                fecha=fecha,
+                hora=hora
             )
-            send_message(payload)
+            result = send_message(payload)
             
-            # Marcar como enviado
-            repo.appointments.update_reminder_status(
+            # 8) Extraer wa_msg_id de la respuesta
+            wa_msg_id = 'unknown'
+            if result and 'messages' in result and len(result['messages']) > 0:
+                wa_msg_id = result['messages'][0].get('id', 'unknown')
+            
+            # 9) BORRAR el recordatorio del appointment inmediatamente después del envío exitoso
+            repo.appointments.delete_reminder(
                 pk=appt['pk'],
                 sk=appt['sk'],
-                new_status='sent'
-            )
-            
-            # Actualizar last_reminder_sent_at
-            key = {'pk': appt['pk'], 'sk': appt['sk']}
-            repo.appointments.update_conditional(
-                key=key,
-                update_expr='SET last_reminder_sent_at = :at',
-                expr_attr_names={},
-                expr_attr_values={':at': now_ms}
+                now_ms=now_ms
             )
             
             sent += 1
             logging.info(
-                "[SchedulerService] Recordatorio enviado: appt=%s, customer=%s",
-                appt.get('appointment_id'), customer_phone
+                "[SchedulerService] Recordatorio enviado y borrado: appt=%s, customer=%s, wa_msg_id=%s",
+                appt.get('appointment_id'), customer_phone, wa_msg_id
             )
             
         except Exception:
             logging.exception("[SchedulerService] Error procesando Appointment: %s", appt)
             try:
-                repo.appointments.update_reminder_status(
+                # Liberar claim para reintentar (o mantener en error)
+                repo.appointments.release_claim(
                     pk=appt['pk'],
                     sk=appt['sk'],
-                    new_status='error'
+                    error_msg='Error al procesar recordatorio'
                 )
             except Exception:
-                logging.exception("[SchedulerService] Error marcando appointment como error")
+                logging.exception("[SchedulerService] Error liberando claim")
     
     return (sent, skipped, canceled_detected)
 
@@ -394,6 +555,7 @@ def run_due_jobs() -> dict:
     Notes:
         - Usa DynamoDB repos exclusivamente (sin SQLAlchemy)
         - Procesa: scheduled messages, appointments, reminders standalone
+        - De-dup intra-tick para evitar envíos duplicados en mismo barrido
     """
     app = _require_app()
     repo = _require_repo()
@@ -415,8 +577,8 @@ def run_due_jobs() -> dict:
 
     if app:
         app.logger.info(
-            "[SchedulerService] run_due_jobs: scheduled_sent=%s, appointments_sent=%s, "
-            "appointments_skipped=%s, appointments_canceled_detected=%s, reminders_sent=%s",
+            "[SCHEDULER] Completed: scheduled_messages=%s, appointment_reminders=%s, "
+            "appointments_skipped=%s, appointments_canceled_detected=%s, standalone_reminders=%s",
             sent_msgs, sent_appt, skipped_appt, canceled_appt, sent_rem,
         )
 
