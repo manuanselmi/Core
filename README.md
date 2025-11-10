@@ -1,137 +1,90 @@
-# 🤖 Agente de IA para WhatsApp con Flask, OpenAI y SQLite
+# 🤖 AgenteIAWpp — WhatsApp AI Agent (Serverless on AWS)
 
-Este proyecto es un bot inteligente de WhatsApp construido con **Python**, **Flask**, la **API de WhatsApp Cloud de Meta**, y **OpenAI**, con persistencia de recordatorios mediante **SQLite**.
-
-El agente puede:
-- Recibir mensajes vía WhatsApp (webhooks).
-- Responder automáticamente con IA usando OpenAI.
-- Agendar y enviar recordatorios personalizados.
+Sistema de agente conversacional para WhatsApp con integración de IA (OpenAI) y persistencia en AWS completamente serverless.
 
 ---
 
-## 🚀 Tecnologías utilizadas
+## 🏗️ Arquitectura General
 
-- Python 3.10+
-- Flask
-- API de WhatsApp Cloud (Meta)
-- API de OpenAI
-- SQLite3
-- Ngrok (para desarrollo local)
-- requests / threading
+**Región primaria:** `sa-east-1`  
+**Secundaria (réplica de datos):** `us-east-1`
 
----
-
-## 📁 Estructura del proyecto
-
-```
-Agente/
-│
-├── app/                     # Lógica principal del bot
-│   ├── agents/             # Lógica del agente OpenAI
-│   ├── core/               # Procesos como recordatorios, envío, etc.
-│   ├── templates/          # HTML si se desea frontend
-│   └── utils/              # Funciones auxiliares (envío de mensajes, logs)
-│
-├── data/                   # Base de datos SQLite
-│   └── recordatorios.db
-│
-├── run.py                  # Script principal para correr la app
-├── app.py                  # Archivo Flask con definición de rutas
-├── init_db.py              # Script para inicializar la base SQLite
-├── requirements.txt        # Dependencias
-└── README.md               # Este archivo
-```
+### Componentes principales
+| Servicio AWS | Función | Detalles |
+|---------------|----------|-----------|
+| **API Gateway (HTTP API v2)** | Endpoint público del webhook | <ul><li>`GET /webhook` → Verificación de Meta</li><li>`POST /webhook` → Recepción de eventos WhatsApp</li><li>`GET /health` → Health-check</li></ul> |
+| **Lambda (Python 3.12 arm64)** | Capa de cómputo principal | Ejecuta `aws.handler.lambda_handler`. Contiene Flask app embebida. |
+| **EventBridge Scheduler** | Jobs programados | Invoca la Lambda con `{ "source": "aws.events", "detail-type": "scheduled-job", "agentMode": "job" }` |
+| **DynamoDB (Global Table)** | Almacenamiento de eventos, usuarios y recordatorios | Tabla única (`single-table design`). Con TTL, PITR y GSIs. Réplica global `us-east-1`. |
+| **Secrets Manager** | Manejo seguro de credenciales | Cada secreto opcional cargado vía `SM_ARN_*` envs. Solo lectura (`secretsmanager:GetSecretValue`). |
+| **CloudWatch Logs + Alarms** | Observabilidad y alertas | Logs dedicados. Alarmas por errores, invocaciones y API Gateway 5xx. |
+| **SNS + Lambda Notifier + SES** | Notificación por email de errores | Canal interno de alertas a equipo de Kairo Agency. |
+| **S3** | Almacenamiento de artefactos | <ul><li>ZIP de código (`app.zip`)</li><li>ZIP de dependencias (layer)</li></ul> |
 
 ---
 
-## 🧠 Cómo funciona
+## ⚙️ Flujo E2E
 
-1. Meta envía los mensajes recibidos a un **webhook Flask**.
-2. Flask procesa el mensaje y puede:
-   - Generar una respuesta con **OpenAI**.
-   - Guardar un recordatorio en **SQLite**.
-3. Un **hilo separado** monitorea los recordatorios y los envía cuando corresponde.
+1. **Webhook de Meta**
+   - `GET /webhook`: Verifica `hub.verify_token` contra Secrets. Si coincide, responde `hub.challenge` en `text/plain`.
+   - `POST /webhook`: Procesa mensajes entrantes de WhatsApp.  
+     ➜ Verifica frescura (`WEBHOOK_STALE_MINUTES`).  
+     ➜ Aplica idempotencia (`wa_event_id` único en DB).  
+     ➜ Inyecta `x-correlation-id` y delega al Orchestrator.
 
----
+2. **Orchestrator + OpenAI**
+   - Determina intención (ej. *agendar*, *cancelar*, *consultar*).  
+   - Interactúa con OpenAI API para generar respuestas.  
+   - Persiste eventos y estados en DynamoDB.
 
-## 🛠️ Instalación local (modo desarrollo)
+3. **Respuestas salientes**
+   - Utilidades de WhatsApp construyen payloads JSON y llaman a la **Graph API (Meta)**.  
+   - Incluye timeouts (`connect=2s`, `read=15s`) y manejo de errores tolerante.
 
-### 1. Clonar el repositorio
-
-```bash
-git clone https://github.com/maticoll/Agente.git
-cd Agente
-```
-
-### 2. Crear entorno virtual e instalar dependencias
-
-```bash
-python -m venv venv
-source venv/bin/activate  # En Windows: venv\Scripts\activate
-pip install -r requirements.txt
-```
-
-### 3. Inicializar la base de datos
-
-```bash
-python init_db.py
-```
-
-### 4. Correr el servidor Flask
-
-```bash
-python run.py
-```
+4. **Tareas programadas**
+   - EventBridge Scheduler dispara la Lambda en modo `job`.  
+   - Se ejecutan recordatorios y tareas recurrentes del agente.
 
 ---
 
-## 🌐 Webhook y conexión con WhatsApp
+## 🔐 Variables de Entorno
 
-Para recibir mensajes de WhatsApp:
+### No secretas
+| Nombre | Descripción |
+|---------|-------------|
+| `GRAPH_API_VERSION` | Ej. `v20.0` |
+| `PHONE_NUMBER_ID` | ID del número de WhatsApp Business |
+| `TZ` | Zona horaria del agente |
+| `WEBHOOK_STALE_MINUTES` | Minutos máximos de validez de un evento (default: 3) |
+| `SIMULATE_TYPING_MS` | Delay simulado de escritura (default: 0) |
+| `AGENT_NAME` | Nombre lógico del agente |
+| `STAGE` | Entorno de despliegue (`prod`, `dev`, etc.) |
+| `SUPABASE_URL` | (opcional) URL de Supabase si aplica |
 
-1. Usá [ngrok](https://ngrok.com/) para exponer tu puerto local:
+### Secretos (ARNs en `SM_ARN_*`)
+| Secreto | Uso |
+|----------|-----|
+| `OPENAI_API_KEY` | Token de OpenAI |
+| `WHATSAPP_ACCESS_TOKEN` | Token de Graph API |
+| `WHATSAPP_VERIFY_TOKEN` | Token de validación del webhook |
+| `DATABASE_URL` | Conexión PostgreSQL (Render) |
+| `SUPABASE_SERVICE_ROLE` | (opcional) Supabase backend |
+| `GOOGLE_SA_JSON` | (opcional) Google Calendar Service Account |
 
-```bash
-ngrok http 5000
-```
-
-2. Copiá la URL generada (ej: `https://xyz.ngrok.io`) y configurala como **Webhook URL** en tu [Meta App Dashboard](https://developers.facebook.com/).
-
-3. Asegurate de validar el webhook y suscribirte a los eventos `messages`.
-
----
-
-## 🧪 Ejemplo de uso
-
-- El usuario envía "recordáme tomar agua en 10 minutos".
-- El bot interpreta el mensaje, guarda el recordatorio, y pasados los 10 minutos responde automáticamente.
-
----
-
-## 📦 Deployment recomendado
-
-Para producción 24/7, se recomienda:
-
-- Hosting en **Render**, **Railway**, **Fly.io** o **AWS EC2**
-- Migrar a una base de datos más robusta (PostgreSQL) si se escalan los usuarios
-- Usar `apscheduler` o `Celery` para manejo profesional de recordatorios
-- Certificado HTTPS (Ngrok solo es temporal)
-- Sistema de logs + backups para la DB
+> El loader ignora secretos faltantes (feature-gate seguro).  
+> Solo se ejecuta `GetSecretValue` si el valor es un ARN válido.
 
 ---
 
-## 📌 Roadmap futuro (sugerido)
+## 🧩 Empaquetado y Despliegue
 
-- ✅ Modularización del bot
-- ⏳ Migración a PostgreSQL
-- ⏳ Panel web para ver/editar recordatorios
-- ⏳ Dockerización
-- ⏳ Hosting en la nube
-
----
-
-## 📝 Licencia
-
-Este proyecto usa la licencia MIT. Ver archivo `LICENCE.txt`.
-
----
+### Estructura
+├── aws/
+│ └── handler.py
+├── app/
+│ ├── services/
+│ ├── db/
+│ ├── orchestrator.py
+│ ├── prompts/
+│ └── ...
+└── agente-stack.yaml
