@@ -168,7 +168,7 @@ def _handle_scheduler_jobs(repo_provider: RepositoryProvider, correlation_id: st
                 
                 payload = get_event_reminder_template_input(
                     recipient=phone,
-                    nombre_sesion=title,
+                    nombre_sesion='Karina',
                     fecha=fecha,
                     hora=hora
                 )

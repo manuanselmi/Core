@@ -105,7 +105,7 @@ def get_event_reminder_template_input(
         "to": recipient,
         "type": "template",
         "template": {
-            "name": "servic",          
+            "name": "recordatorio",          
             "language": {"code": "es_AR"},
             "components": [
                 {
