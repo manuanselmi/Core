@@ -1,0 +1,909 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: Agent stack (API Gateway + Lambda + EventBridge Scheduler) - 1 agente por stack
+
+Parameters:
+  AgentName:
+    Type: String
+    Description: Nombre lógico del agente (ej. AgentePrueba1)
+
+  StageName:
+    Type: String
+    Default: prod
+
+  # Código Lambda (ZIP en S3)
+
+  CodeS3Bucket:
+    Type: String
+    Description: Bucket S3 con el ZIP del código (sin s3://)
+  CodeS3Key:
+    Type: String
+    Description: Key S3 del ZIP del código (ruta/archivo.zip)
+  CodeS3ObjectVersion:
+    Type: String
+    Default: ''
+    Description: (Opcional) VersionId del objeto en S3
+
+  # Layer (ZIP en S3)
+
+  DepsS3Bucket:
+    Type: String
+    Default: ''
+    Description: Bucket S3 con el ZIP del layer (puede ser el mismo que CodeS3Bucket)
+  DepsS3Key:
+    Type: String
+    Default: ''
+    Description: Key S3 del ZIP del layer (ej. layers/deps_layer.zip)
+  DepsS3ObjectVersion:
+    Type: String
+    Default: ''
+    Description: (Opcional) VersionId del objeto del layer en S3
+
+  LambdaMemory:
+    Type: Number
+    Default: 512
+  LambdaTimeout:
+    Type: Number
+    Default: 28
+  Architecture:
+    Type: String
+    AllowedValues:
+      - x86_64
+      - arm64
+    Default: arm64
+  LogRetentionInDays:
+    Type: Number
+    Default: 14
+
+  # ENV no secretos
+
+  GraphApiVersion:
+    Type: String
+    Default: v20.0
+  OpenAIModel:
+    Type: String
+    Default: ''
+    Description: Modelo de OpenAI a utilizar.
+  PhoneNumberId:
+    Type: String
+    Default: ''
+  TimeZone:
+    Type: String
+    Default: America/Montevideo
+  WebhookStaleMinutes:
+    Type: Number
+    Default: 3
+  SimulateTypingMs:
+    Type: Number
+    Default: 0
+  AgentPublicName:
+    Type: String
+    Default: ''
+    Description: Metadato opcional (AGENT_NAME)
+  StagePublicName:
+    Type: String
+    Default: ''
+    Description: Metadato opcional (STAGE)
+  SupabaseUrl:
+    Type: String
+    Default: ''
+    Description: Opcional (no secreto)
+
+  # Google Calendar (opcionales)
+
+  GoogleCalendarId:
+    Type: String
+    Default: ''
+    Description: (Opcional) ID del calendario por defecto (si vacío → 'primary')
+  GoogleCalendarIdSpecial:
+    Type: String
+    Default: ''
+    Description: (Opcional) ID del calendario especial para un WAID concreto
+  SpecialWaid:
+    Type: String
+    Default: ''
+    Description: (Opcional) WAID especial (solo dígitos, sin '+')
+  LucasWaid:
+    Type: String
+    Default: ''
+    Description: (Opcional) WAID para notificaciones por WhatsApp
+  GoogleDelegatedUser:
+    Type: String
+    Default: ''
+    Description: (Opcional) Usuario delegado (Domain-wide delegation)
+
+  # ARNs de Secrets (opcionales)
+
+  OpenAIApiKeySecretArn:
+    Type: String
+    Default: ''
+  WhatsAppAccessTokenSecretArn:
+    Type: String
+    Default: ''
+  WhatsAppVerifyTokenSecretArn:
+    Type: String
+    Default: ''
+  SupabaseServiceRoleSecretArn:
+    Type: String
+    Default: ''
+  GoogleServiceAccountSecretArn:
+    Type: String
+    Default: ''
+
+  # Programación de jobs
+
+  ScheduleExpression:
+    Type: String
+    Default: cron(0/1 * * * ? *)
+
+  # ------------------------------
+  # DynamoDB (single-table) - nuevos parámetros
+  # ------------------------------
+
+  DynamoTableName:
+    Type: String
+    Default: ''
+    Description: Nombre opcional de la tabla DynamoDB. Si vacío, se compone automáticamente.
+  EnableDynamoPITR:
+    Type: String
+    AllowedValues:
+      - 'true'
+      - 'false'
+    Default: 'true'
+    Description: Habilita Point-in-Time Recovery (PITR) de DynamoDB.
+  EnableDynamoSSE:
+    Type: String
+    AllowedValues:
+      - 'true'
+      - 'false'
+    Default: 'true'
+    Description: Habilita cifrado del lado del servidor (SSE) en DynamoDB.
+  DynamoTTLAttribute:
+    Type: String
+    Default: ttl
+    Description: Nombre del atributo TTL (por defecto 'ttl')
+
+  # ------------------------------
+  # Alertas SES
+  # ------------------------------
+
+  SesRegion:
+    Type: String
+    Default: sa-east-1
+    Description: Región de SES para envío de alertas
+  AlertFromEmail:
+    Type: String
+    Description: Email origen para alertas (ej. manuel@kairoagency.com)
+  AlertEmails:
+    Type: String
+    Description: Emails destino para alertas (separados por coma)
+  AlertSubjectPrefix:
+    Type: String
+    Default: '[ALERTA agente]'
+    Description: Prefijo del asunto de alertas
+
+Conditions:
+  HasCodeVersion: !Not
+    - !Equals
+      - !Ref CodeS3ObjectVersion
+      - ''
+  HasOpenAI: !Not
+    - !Equals
+      - !Ref OpenAIApiKeySecretArn
+      - ''
+  HasWAAccess: !Not
+    - !Equals
+      - !Ref WhatsAppAccessTokenSecretArn
+      - ''
+  HasWAVerify: !Not
+    - !Equals
+      - !Ref WhatsAppVerifyTokenSecretArn
+      - ''
+  HasSupabaseRole: !Not
+    - !Equals
+      - !Ref SupabaseServiceRoleSecretArn
+      - ''
+  HasGoogleSA: !Not
+    - !Equals
+      - !Ref GoogleServiceAccountSecretArn
+      - ''
+  HasDepsKey: !Not
+    - !Equals
+      - !Ref DepsS3Key
+      - ''
+  HasDepsVersion: !Not
+    - !Equals
+      - !Ref DepsS3ObjectVersion
+      - ''
+  HasCustomDynamoName: !Not
+    - !Equals
+      - !Ref DynamoTableName
+      - ''
+  HasAgentName: !Not
+    - !Equals
+      - !Ref AgentName
+      - ''
+  HasStageName: !Not
+    - !Equals
+      - !Ref StageName
+      - ''
+  HasAgentAndStage: !And
+    - !Condition HasAgentName
+    - !Condition HasStageName
+  EnableSSETrue: !Equals
+    - !Ref EnableDynamoSSE
+    - 'true'
+  EnablePITRTrue: !Equals
+    - !Ref EnableDynamoPITR
+    - 'true'
+
+Resources:
+  # ------------------------------------
+  # SNS Topic para Alarmas
+  # ------------------------------------
+
+  AlarmsTopic:
+    Type: AWS::SNS::Topic
+    Properties:
+      TopicName: !Sub ${AgentName}-alarms-topic
+
+  AlarmsTopicPolicy:
+    Type: AWS::SNS::TopicPolicy
+    Properties:
+      Topics:
+        - !Ref AlarmsTopic
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: cloudwatch.amazonaws.com
+            Action: sns:Publish
+            Resource: !Ref AlarmsTopic
+
+  # ------------------------------------
+  # Lambda Notifier (SNS → SES)
+  # ------------------------------------
+
+  AlarmSesNotifierLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub /aws/lambda/${AgentName}-alarm-notifier
+      RetentionInDays: !Ref LogRetentionInDays
+
+  AlarmSesNotifierRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub ${AgentName}-alarm-notifier-role
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      Path: /
+      Policies:
+        - PolicyName: logs-basic
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Sid: CreateLogGroup
+                Effect: Allow
+                Action: logs:CreateLogGroup
+                Resource: '*'
+              - Sid: LogsWrite
+                Effect: Allow
+                Action:
+                  - logs:CreateLogStream
+                  - logs:PutLogEvents
+                Resource: !Sub arn:${AWS::Partition}:logs:${AWS::Region}:${AWS::AccountId}:log-group:/aws/lambda/${AgentName}-alarm-notifier:*
+        - PolicyName: ses-send
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Sid: SesSendEmail
+                Effect: Allow
+                Action: ses:SendEmail
+                Resource: '*'
+                Condition:
+                  StringEquals:
+                    ses:FromAddress: !Ref AlertFromEmail
+
+  AlarmSesNotifier:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub ${AgentName}-alarm-notifier
+      Runtime: python3.12
+      Architectures:
+        - arm64
+      Role: !GetAtt AlarmSesNotifierRole.Arn
+      Handler: aws.alarm_notifier.lambda_handler
+      MemorySize: 128
+      Timeout: 10
+      Environment:
+        Variables:
+          SES_REGION: !Ref SesRegion
+          FROM_EMAIL: !Ref AlertFromEmail
+          ALERT_EMAILS: !Ref AlertEmails
+          SUBJECT_PREFIX: !Ref AlertSubjectPrefix
+      Code:
+        S3Bucket: !Ref CodeS3Bucket
+        S3Key: !Ref CodeS3Key
+        S3ObjectVersion: !If
+          - HasCodeVersion
+          - !Ref CodeS3ObjectVersion
+          - !Ref AWS::NoValue
+
+  AlarmSesNotifierPermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref AlarmSesNotifier
+      Action: lambda:InvokeFunction
+      Principal: sns.amazonaws.com
+      SourceArn: !Ref AlarmsTopic
+
+  AlarmSesNotifierSubscription:
+    Type: AWS::SNS::Subscription
+    Properties:
+      Protocol: lambda
+      TopicArn: !Ref AlarmsTopic
+      Endpoint: !GetAtt AlarmSesNotifier.Arn
+
+  # ------------------------------------
+  # CloudWatch Alarms
+  # ------------------------------------
+
+  LambdaErrorsAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub ${AgentName}-lambda-errors
+      AlarmDescription: Errores en la función Lambda principal
+      MetricName: Errors
+      Namespace: AWS/Lambda
+      Statistic: Sum
+      Period: 300
+      EvaluationPeriods: 1
+      Threshold: 1
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      Dimensions:
+        - Name: FunctionName
+          Value: !Ref AgentFunction
+      AlarmActions:
+        - !Ref AlarmsTopic
+      TreatMissingData: notBreaching
+
+  Api5xxAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub ${AgentName}-api-5xx
+      AlarmDescription: Errores 5xx en API Gateway
+      MetricName: 5xx
+      Namespace: AWS/ApiGateway
+      Statistic: Sum
+      Period: 300
+      EvaluationPeriods: 1
+      Threshold: 1
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      Dimensions:
+        - Name: ApiId
+          Value: !Ref Api
+        - Name: Stage
+          Value: !Ref StageName
+      AlarmActions:
+        - !Ref AlarmsTopic
+      TreatMissingData: notBreaching
+
+  SchedulerTargetErrorAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub ${AgentName}-scheduler-target-errors
+      AlarmDescription: Errores en invocación de targets desde EventBridge Scheduler
+      MetricName: TargetErrorCount
+      Namespace: AWS/Scheduler
+      Statistic: Sum
+      Period: 300
+      EvaluationPeriods: 1
+      Threshold: 1
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      Dimensions:
+        - Name: ScheduleGroup
+          Value: default
+      AlarmActions:
+        - !Ref AlarmsTopic
+      TreatMissingData: notBreaching
+
+  SchedulerDroppedAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub ${AgentName}-scheduler-dropped
+      AlarmDescription: Invocaciones descartadas por EventBridge Scheduler
+      MetricName: InvocationDroppedCount
+      Namespace: AWS/Scheduler
+      Statistic: Sum
+      Period: 300
+      EvaluationPeriods: 1
+      Threshold: 1
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      Dimensions:
+        - Name: ScheduleGroup
+          Value: default
+      AlarmActions:
+        - !Ref AlarmsTopic
+      TreatMissingData: notBreaching
+
+  # ------------------------------------
+  # Recursos existentes (sin cambios)
+  # ------------------------------------
+
+  AgentLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub /aws/lambda/${AgentName}-handler
+      RetentionInDays: !Ref LogRetentionInDays
+
+  AgentFunctionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub ${AgentName}-lambda-role
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      Path: /
+      Policies:
+        - PolicyName: logs-basic
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Sid: Logs
+                Effect: Allow
+                Action:
+                  - logs:CreateLogGroup
+                  - logs:CreateLogStream
+                  - logs:PutLogEvents
+                Resource: !Sub arn:aws:logs:${AWS::Region}:${AWS::AccountId}:log-group:/aws/lambda/${AgentName}-handler:*
+        # Inline policy DynamoDB (mínimo privilegio, sin comodines globales)
+        - PolicyName: dynamodb-access
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Sid: DynamoReadWrite
+                Effect: Allow
+                Action:
+                  - dynamodb:GetItem
+                  - dynamodb:Query
+                  - dynamodb:BatchGetItem
+                  - dynamodb:PutItem
+                  - dynamodb:UpdateItem
+                  - dynamodb:DeleteItem
+                  - dynamodb:BatchWriteItem
+                  - dynamodb:DescribeTable
+                Resource:
+                  - !Sub arn:aws:dynamodb:${AWS::Region}:${AWS::AccountId}:table/${AgentDataTable}
+                  - !Sub arn:aws:dynamodb:${AWS::Region}:${AWS::AccountId}:table/${AgentDataTable}/index/*
+
+  # Secrets: políticas separadas (mínimo privilegio)
+
+  PolicyOpenAI:
+    Type: AWS::IAM::Policy
+    Condition: HasOpenAI
+    Properties:
+      PolicyName: !Sub ${AgentName}-sm-openai
+      Roles:
+        - !Ref AgentFunctionRole
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Action: secretsmanager:GetSecretValue
+            Resource: !Ref OpenAIApiKeySecretArn
+
+  PolicyWAAccess:
+    Type: AWS::IAM::Policy
+    Condition: HasWAAccess
+    Properties:
+      PolicyName: !Sub ${AgentName}-sm-wa-access
+      Roles:
+        - !Ref AgentFunctionRole
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Action: secretsmanager:GetSecretValue
+            Resource: !Ref WhatsAppAccessTokenSecretArn
+
+  PolicyWAVerify:
+    Type: AWS::IAM::Policy
+    Condition: HasWAVerify
+    Properties:
+      PolicyName: !Sub ${AgentName}-sm-wa-verify
+      Roles:
+        - !Ref AgentFunctionRole
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Action: secretsmanager:GetSecretValue
+            Resource: !Ref WhatsAppVerifyTokenSecretArn
+
+  PolicySupabaseRole:
+    Type: AWS::IAM::Policy
+    Condition: HasSupabaseRole
+    Properties:
+      PolicyName: !Sub ${AgentName}-sm-supabase-role
+      Roles:
+        - !Ref AgentFunctionRole
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Action: secretsmanager:GetSecretValue
+            Resource: !Ref SupabaseServiceRoleSecretArn
+
+  PolicyGoogleSA:
+    Type: AWS::IAM::Policy
+    Condition: HasGoogleSA
+    Properties:
+      PolicyName: !Sub ${AgentName}-sm-google-sa
+      Roles:
+        - !Ref AgentFunctionRole
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Action: secretsmanager:GetSecretValue
+            Resource: !Ref GoogleServiceAccountSecretArn
+
+  DepsLayer:
+    Type: AWS::Lambda::LayerVersion
+    Condition: HasDepsKey
+    Properties:
+      LayerName: !Sub ${AgentName}-deps
+      CompatibleRuntimes:
+        - python3.12
+      CompatibleArchitectures:
+        - !Ref Architecture
+      Content:
+        S3Bucket: !If
+          - HasDepsKey
+          - !Ref DepsS3Bucket
+          - !Ref AWS::NoValue
+        S3Key: !If
+          - HasDepsKey
+          - !Ref DepsS3Key
+          - !Ref AWS::NoValue
+        S3ObjectVersion: !If
+          - HasDepsVersion
+          - !Ref DepsS3ObjectVersion
+          - !Ref AWS::NoValue
+      Description: Python deps layer for ${AgentName}
+
+  AgentFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub ${AgentName}-handler
+      Runtime: python3.12
+      Architectures:
+        - !Ref Architecture
+      Role: !GetAtt AgentFunctionRole.Arn
+      Handler: aws.handler.lambda_handler
+      MemorySize: !Ref LambdaMemory
+      Timeout: !Ref LambdaTimeout
+      Environment:
+        Variables:
+          GRAPH_API_VERSION: !Ref GraphApiVersion
+          OPENAI_MODEL: !Ref OpenAIModel
+          PHONE_NUMBER_ID: !Ref PhoneNumberId
+          TZ: !Ref TimeZone
+          WEBHOOK_STALE_MINUTES: !Ref WebhookStaleMinutes
+          SIMULATE_TYPING_MS: !Ref SimulateTypingMs
+          AGENT_NAME: !Ref AgentPublicName
+          STAGE: !Ref StagePublicName
+          SUPABASE_URL: !Ref SupabaseUrl
+          # Google Calendar (opcionales)
+          GOOGLE_CALENDAR_ID: !Ref GoogleCalendarId
+          GOOGLE_CALENDAR_ID_SPECIAL: !Ref GoogleCalendarIdSpecial
+          SPECIAL_WAID: !Ref SpecialWaid
+          LUCAS_WAID: !Ref LucasWaid
+          GOOGLE_DELEGATED_USER: !Ref GoogleDelegatedUser
+          # ARNs de secrets (opcionales; tu loader los valida)
+          SM_ARN_OPENAI_API_KEY: !Ref OpenAIApiKeySecretArn
+          SM_ARN_WHATSAPP_ACCESS_TOKEN: !Ref WhatsAppAccessTokenSecretArn
+          SM_ARN_WHATSAPP_VERIFY_TOKEN: !Ref WhatsAppVerifyTokenSecretArn
+          SM_ARN_SUPABASE_SERVICE_ROLE: !Ref SupabaseServiceRoleSecretArn
+          SM_ARN_GOOGLE_SA: !Ref GoogleServiceAccountSecretArn
+          # DynamoDB (single-table)
+          DYNAMO_TABLE_NAME: !Ref AgentDataTable
+      Code:
+        S3Bucket: !Ref CodeS3Bucket
+        S3Key: !Ref CodeS3Key
+        S3ObjectVersion: !If
+          - HasCodeVersion
+          - !Ref CodeS3ObjectVersion
+          - !Ref AWS::NoValue
+      Layers: !If
+        - HasDepsKey
+        - - !Ref DepsLayer
+        - !Ref AWS::NoValue
+
+  Api:
+    Type: AWS::ApiGatewayV2::Api
+    Properties:
+      Name: !Sub ${AgentName}-api
+      ProtocolType: HTTP
+
+  ApiIntegration:
+    Type: AWS::ApiGatewayV2::Integration
+    Properties:
+      ApiId: !Ref Api
+      IntegrationType: AWS_PROXY
+      IntegrationUri: !Sub arn:aws:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${AgentFunction.Arn}/invocations
+      PayloadFormatVersion: '2.0'
+      TimeoutInMillis: 29000
+
+  RouteGetWebhook:
+    Type: AWS::ApiGatewayV2::Route
+    Properties:
+      ApiId: !Ref Api
+      RouteKey: GET /webhook
+      Target: !Sub integrations/${ApiIntegration}
+
+  RoutePostWebhook:
+    Type: AWS::ApiGatewayV2::Route
+    Properties:
+      ApiId: !Ref Api
+      RouteKey: POST /webhook
+      Target: !Sub integrations/${ApiIntegration}
+
+  ApiStage:
+    Type: AWS::ApiGatewayV2::Stage
+    Properties:
+      ApiId: !Ref Api
+      StageName: !Ref StageName
+      AutoDeploy: true
+
+  PermissionApiInvoke:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref AgentFunction
+      Action: lambda:InvokeFunction
+      Principal: apigateway.amazonaws.com
+      SourceArn: !Sub arn:aws:execute-api:${AWS::Region}:${AWS::AccountId}:${Api}/${StageName}/*/webhook
+
+  SchedulerInvokeRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub ${AgentName}-scheduler-role
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: scheduler.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: lambda-invoke
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action: lambda:InvokeFunction
+                Resource: !GetAtt AgentFunction.Arn
+
+  MaintenanceSchedule:
+    Type: AWS::Scheduler::Schedule
+    Properties:
+      Name: !Sub ${AgentName}-maintenance
+      FlexibleTimeWindow:
+        Mode: 'OFF'
+      ScheduleExpression: !Ref ScheduleExpression
+      Target:
+        Arn: !GetAtt AgentFunction.Arn
+        RoleArn: !GetAtt SchedulerInvokeRole.Arn
+        Input: |
+          {"source":"aws.events","detail-type":"scheduled-job","agentMode":"job"}
+
+  # ------------------------------------
+  # DynamoDB Single-Table (PK/SK + 6 GSIs)
+  # ------------------------------------
+
+  AgentDataTable:
+    Type: AWS::DynamoDB::Table
+    DeletionPolicy: Retain
+    UpdateReplacePolicy: Retain
+    Properties:
+      TableName: !If
+        - HasCustomDynamoName
+        - !Ref DynamoTableName
+        - !If
+          - HasAgentAndStage
+          - !Sub ${AgentName}-${StageName}-agentdata
+          - !Sub ${AWS::StackName}-agentdata
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+        - AttributeName: pk
+          AttributeType: S
+        - AttributeName: sk
+          AttributeType: S
+        - AttributeName: wa_msg_id
+          AttributeType: S
+        - AttributeName: item_type
+          AttributeType: S
+        - AttributeName: intent_wa_msg_id
+          AttributeType: S
+        - AttributeName: google_event_id
+          AttributeType: S
+        - AttributeName: status
+          AttributeType: S
+        - AttributeName: starts_at_epoch
+          AttributeType: 'N'
+        - AttributeName: reminder_status_status
+          AttributeType: S
+        - AttributeName: remind_at_epoch
+          AttributeType: 'N'
+        - AttributeName: send_at_epoch
+          AttributeType: 'N'
+      KeySchema:
+        - AttributeName: pk
+          KeyType: HASH
+        - AttributeName: sk
+          KeyType: RANGE
+      GlobalSecondaryIndexes:
+        - IndexName: ByWaMsgId
+          KeySchema:
+            - AttributeName: wa_msg_id
+              KeyType: HASH
+            - AttributeName: item_type
+              KeyType: RANGE
+          Projection:
+            ProjectionType: INCLUDE
+            NonKeyAttributes:
+              - pk
+              - sk
+              - status
+              - send_at_epoch
+              - starts_at_epoch
+              - remind_at_epoch
+        - IndexName: ByIntentMsgId
+          KeySchema:
+            - AttributeName: intent_wa_msg_id
+              KeyType: HASH
+          Projection:
+            ProjectionType: INCLUDE
+            NonKeyAttributes:
+              - pk
+              - sk
+              - starts_at_epoch
+              - status
+              - appointment_id
+        - IndexName: ByGoogleEvent
+          KeySchema:
+            - AttributeName: google_event_id
+              KeyType: HASH
+          Projection:
+            ProjectionType: INCLUDE
+            NonKeyAttributes:
+              - pk
+              - sk
+              - starts_at_epoch
+              - status
+        - IndexName: ApptStatusStartsAt
+          KeySchema:
+            - AttributeName: status
+              KeyType: HASH
+            - AttributeName: starts_at_epoch
+              KeyType: RANGE
+          Projection:
+            ProjectionType: INCLUDE
+            NonKeyAttributes:
+              - pk
+              - sk
+              - customer_phone
+              - appointment_id
+        - IndexName: ApptReminderQueue
+          KeySchema:
+            - AttributeName: reminder_status_status
+              KeyType: HASH
+            - AttributeName: remind_at_epoch
+              KeyType: RANGE
+          Projection:
+            ProjectionType: INCLUDE
+            NonKeyAttributes:
+              - pk
+              - sk
+              - appointment_id
+              - wa_msg_id
+        - IndexName: SmStatusSendAt
+          KeySchema:
+            - AttributeName: status
+              KeyType: HASH
+            - AttributeName: send_at_epoch
+              KeyType: RANGE
+          Projection:
+            ProjectionType: INCLUDE
+            NonKeyAttributes:
+              - pk
+              - sk
+              - customer_phone
+              - wa_msg_id
+      SSESpecification:
+        SSEEnabled: !If
+          - EnableSSETrue
+          - true
+          - false
+      PointInTimeRecoverySpecification:
+        PointInTimeRecoveryEnabled: !If
+          - EnablePITRTrue
+          - true
+          - false
+      TimeToLiveSpecification:
+        AttributeName: !Ref DynamoTTLAttribute
+        Enabled: true
+      Tags:
+        - !If
+          - HasAgentName
+          - Key: AgentName
+            Value: !Ref AgentName
+          - !Ref AWS::NoValue
+        - !If
+          - HasStageName
+          - Key: StageName
+            Value: !Ref StageName
+          - !Ref AWS::NoValue
+  Function:
+    Type: AWS::Serverless::Function
+    Properties:
+      Description: !Sub
+        - Stack ${AWS::StackName} Function ${ResourceName}
+        - ResourceName: Function
+      CodeUri: src/Function
+      Handler: index.handler
+      Runtime: nodejs22.x
+      MemorySize: 3008
+      Timeout: 30
+      Tracing: Active
+  FunctionLogGroup:
+    Type: AWS::Logs::LogGroup
+    DeletionPolicy: Retain
+    Properties:
+      LogGroupName: !Sub /aws/lambda/${Function}
+
+Outputs:
+  WebhookUrl:
+    Description: URL del webhook (GET verify / POST events)
+    Value: !Sub https://${Api}.execute-api.${AWS::Region}.amazonaws.com/${StageName}/webhook
+  ApiBaseUrl:
+    Description: Base URL del API
+    Value: !Sub https://${Api}.execute-api.${AWS::Region}.amazonaws.com/${StageName}
+  FunctionName:
+    Description: Lambda function name
+    Value: !Ref AgentFunction
+  DepsLayerArn:
+    Condition: HasDepsKey
+    Description: ARN del Layer de dependencias
+    Value: !Ref DepsLayer
+  DynamoTableName:
+    Description: Nombre de la tabla DynamoDB (single-table)
+    Value: !Ref AgentDataTable
+  DynamoTableArn:
+    Description: ARN de la tabla DynamoDB
+    Value: !GetAtt AgentDataTable.Arn
+  AlarmsTopicArn:
+    Description: ARN del SNS Topic para alarmas
+    Value: !Ref AlarmsTopic
+  LambdaErrorsAlarmName:
+    Description: Nombre de la alarma de errores Lambda
+    Value: !Ref LambdaErrorsAlarm
+  Api5xxAlarmName:
+    Description: Nombre de la alarma de errores 5xx API
+    Value: !Ref Api5xxAlarm
+  SchedulerTargetErrorAlarmName:
+    Description: Nombre de la alarma de errores de target Scheduler
+    Value: !Ref SchedulerTargetErrorAlarm
+  SchedulerDroppedAlarmName:
+    Description: Nombre de la alarma de invocaciones descartadas Scheduler
+    Value: !Ref SchedulerDroppedAlarm
+Transform: AWS::Serverless-2016-10-31
