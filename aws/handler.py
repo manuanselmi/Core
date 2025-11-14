@@ -5,6 +5,9 @@ from datetime import datetime, timezone, timedelta
 from app.config.secrets_loader import load_into_env
 load_into_env()
 
+# FORZAR ERROR PARA PROBAR ALARMA
+raise RuntimeError("❌ ERROR FORZADO: Testing CloudWatch Alarm")
+
 sys.stdout = io.TextIOWrapper(sys.stdout.buffer, encoding="utf-8")
 sys.stderr = io.TextIOWrapper(sys.stderr.buffer, encoding="utf-8")
 
