@@ -1,12 +1,9 @@
-import os, json, logging, base64, time, sys, io
+import os, json, logging, base64, time, sys, io, re
 from datetime import datetime, timezone, timedelta
 
 # ── Secrets primero (robusto a opcionales) ─────────────────────
 from app.config.secrets_loader import load_into_env
 load_into_env()
-
-# FORZAR ERROR PARA PROBAR ALARMA
-raise RuntimeError("❌ ERROR FORZADO: Testing CloudWatch Alarm")
 
 sys.stdout = io.TextIOWrapper(sys.stdout.buffer, encoding="utf-8")
 sys.stderr = io.TextIOWrapper(sys.stderr.buffer, encoding="utf-8")
@@ -43,6 +40,7 @@ APP.config["GRAPH_API_VERSION"] = os.getenv("GRAPH_API_VERSION", "v23.0").lstrip
 APP.config["PHONE_NUMBER_ID"]   = os.getenv("PHONE_NUMBER_ID")
 APP.config["ACCESS_TOKEN"]      = os.getenv("WHATSAPP_ACCESS_TOKEN") or os.getenv("ACCESS_TOKEN")
 VERIFY_TOKEN                    = os.getenv("WHATSAPP_VERIFY_TOKEN") or os.getenv("VERIFY_TOKEN")
+ADMIN_WA_ID                     = os.getenv("ADMIN_WA_ID", "")
 LOCAL_TZ                        = os.getenv("TZ", "America/Montevideo")
 
 if not APP.config["PHONE_NUMBER_ID"] or not APP.config["ACCESS_TOKEN"]:
@@ -91,6 +89,23 @@ ACCESS_TOKEN = APP.config["ACCESS_TOKEN"]
 # ─────────────────────────────────────────────────────────────────────────────
 # Helpers
 # ─────────────────────────────────────────────────────────────────────────────
+
+def _norm_waid(wa_id: str | None) -> str | None:
+    """Normaliza wa_id a solo dígitos (igual que en GoogleCalendarService)."""
+    if not wa_id:
+        return None
+    return re.sub(r"\D", "", str(wa_id))
+
+def _is_admin_waid(wa_id: str | None) -> bool:
+    """
+    Retorna True si wa_id coincide con ADMIN_WA_ID (ambos normalizados).
+    Si ADMIN_WA_ID está vacío, siempre retorna False.
+    """
+    if not ADMIN_WA_ID:
+        return False
+    norm_admin = _norm_waid(ADMIN_WA_ID)
+    norm_user = _norm_waid(wa_id)
+    return norm_admin and norm_user and norm_admin == norm_user
 
 def _is_eventbridge(evt: dict) -> bool:
     """Verdadero si la invocación viene de EventBridge Scheduler."""
@@ -371,6 +386,15 @@ def lambda_handler(event, context):
             phone_number_id = value["metadata"]["phone_number_id"]
             wamid    = msg_obj.get("id")
             
+            # Detectar si es admin
+            is_admin = _is_admin_waid(wa_id)
+            logger.info(
+                "[CID=%s] Incoming message wa_id=%s is_admin=%s",
+                correlation_id,
+                _norm_waid(wa_id),
+                is_admin,
+            )
+            
             # Obtener timeEpoch para staleness guard
             request_ctx = event.get("requestContext", {})
             time_epoch_ms = request_ctx.get("timeEpoch")
@@ -462,7 +486,13 @@ def lambda_handler(event, context):
             # La idempotencia está garantizada por el guardado temprano del turn
             # Pasar repo_provider al orchestrator
             # TODO: Modificar orchestrator para recibir repo_provider (próxima iteración)
-            bot_reply = orchestrator.handle_message(user_msg or "", wa_id, name, wamid)
+            bot_reply = orchestrator.handle_message(
+                user_msg or "",
+                wa_id,
+                name,
+                wamid,
+                is_admin=is_admin,
+            )
 
             # 2.7) Construcción de payload de salida
             payload = None

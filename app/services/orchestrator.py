@@ -79,6 +79,7 @@ class Orchestrator:
         self.current_customer_id = None
         self.current_phone = None
         self.current_name = None
+        self.current_is_admin = False
         
         # Dynamo repositories (fallback si no se inyecta)
         if repo_provider is None:
@@ -125,12 +126,25 @@ class Orchestrator:
         except Exception:
             return None
 
-    def handle_message(self, message: str, phone: str, name: str | None, wa_msg_id: str | None):
+    def handle_message(
+        self,
+        message: str,
+        phone: str,
+        name: str | None,
+        wa_msg_id: str | None,
+        is_admin: bool = False,
+    ):
         """
         Entrada principal. Mantengo el flujo original y sólo adapto el scheduling.
         """
         cid = self.correlation_id_provider()
-        self.logger.info(f"[CID={cid}] handle_message → phone={phone}, wa_msg_id={wa_msg_id}")
+        self.logger.info(
+            "[CID=%s] handle_message → phone=%s, wa_msg_id=%s, is_admin=%s",
+            cid,
+            phone,
+            wa_msg_id,
+            is_admin,
+        )
         
         user = CustomerService.find_or_create(phone, name, repo_provider=self.repo)
         # En Dynamo no hay customer_id numérico, guardamos None para compatibilidad
@@ -138,6 +152,7 @@ class Orchestrator:
         self.current_phone = phone
         self.current_name = name
         self.current_wa_msg_id = wa_msg_id  # Para idempotencia en schedule_meeting
+        self.current_is_admin = bool(is_admin)
 
         # Assistants (igual)
         reply = self._assistant_reply(user.get("phone"), message or "", name, wa_msg_id)
@@ -431,6 +446,18 @@ class Orchestrator:
         Despacha la ejecución de una tool function a su método correspondiente.
         Retorna el resultado en formato dict o None.
         """
+        # Admin security check: only admin can call admin_* tools
+        if tool_name.startswith("admin_"):
+            if not self.current_is_admin:
+                current_app.logger.warning(
+                    "[_dispatch_tool] admin tool %s called by non-admin user",
+                    tool_name
+                )
+                return {
+                    "error": "forbidden",
+                    "message": "Solo el administrador puede ejecutar esta acción."
+                }
+        
         # Mapeo de nombres de tools a métodos
         tool_map = {
             "create_reminder": self.create_reminder,
@@ -443,6 +470,10 @@ class Orchestrator:
             "cancel_scheduled_message": self.cancel_scheduled_message,
             "cancelar": self.cancel_meeting,
             "list_upcoming_appointments": self.list_upcoming_appointments,
+            # Admin tools
+            "admin_list_appointments": self.admin_list_appointments,
+            "admin_cancel_appointment": self.admin_cancel_appointment,
+            "admin_block_day": self.admin_block_day,
         }
         
         handler = tool_map.get(tool_name)
@@ -572,6 +603,16 @@ class Orchestrator:
         from datetime import datetime, timezone
         from app.db.dynamo_client import now_ms
         
+        # Log de entrada con contexto completo
+        self.logger.debug(
+            "[CANCEL] Entry → appointment_id=%s, google_event_id=%s, current_phone=%s, current_is_admin=%s, wa_msg_id=%s",
+            appointment_id,
+            google_event_id,
+            self.current_phone,
+            self.current_is_admin,
+            getattr(self, 'current_wa_msg_id', None)
+        )
+        
         # Buscar appointment
         appt = None
         if google_event_id:
@@ -584,8 +625,68 @@ class Orchestrator:
         if not appt:
             return {"error": "appointment_not_found", "message": "No encontré esa cita."}
         
+        # Log detallado del appointment encontrado
+        self.logger.debug(
+            "[CANCEL] Appointment encontrado: appointment_id=%s, pk=%s, sk=%s, status=%s, customer_phone=%s, google_event_id=%s, google_calendar_id=%s",
+            appt.get('appointment_id'),
+            appt.get('pk'),
+            appt.get('sk'),
+            appt.get('status'),
+            appt.get('customer_phone'),
+            appt.get('google_event_id'),
+            appt.get('google_calendar_id')
+        )
+        
         if appt.get('status') == 'canceled':
             return {"message": "Esta cita ya estaba cancelada."}
+        
+        # Authorization check: admin can cancel any appointment, regular users only their own
+        if not self.current_is_admin:
+            # Inferir phone del appointment (con fallback a PK y reparación)
+            appt_phone = self._infer_appt_phone(appt)
+            current_phone = self.current_phone
+            
+            # Normalizar ambos phones para comparación consistente
+            from app.utils.phone_utils import normalize_phone_e164
+            try:
+                appt_phone_norm = normalize_phone_e164(appt_phone) if appt_phone else None
+                current_phone_norm = normalize_phone_e164(current_phone) if current_phone else None
+            except Exception:
+                # Fallback: comparación directa si falla normalización
+                appt_phone_norm = appt_phone
+                current_phone_norm = current_phone
+            
+            self.logger.debug(
+                "[CANCEL] Authorization check: appt_phone=%s (norm=%s), current_phone=%s (norm=%s)",
+                appt_phone, appt_phone_norm, current_phone, current_phone_norm
+            )
+            
+            # Verificar autorización
+            if appt_phone_norm is None:
+                # No pudimos determinar el owner del appointment
+                self.logger.warning(
+                    "[CANCEL] No pude determinar el owner de la cita (sin customer_phone ni PK válida); bloqueando cancelación para usuario no admin. appointment_id=%s",
+                    appt.get('appointment_id')
+                )
+                return {
+                    "error": "forbidden",
+                    "message": "No se pudo verificar el propietario de esta cita."
+                }
+            
+            if appt_phone_norm != current_phone_norm:
+                self.logger.warning(
+                    "[CANCEL] Authorization failed: user %s tried to cancel appointment of %s",
+                    current_phone_norm, appt_phone_norm
+                )
+                return {
+                    "error": "forbidden",
+                    "message": "No puedes cancelar citas de otros usuarios."
+                }
+            
+            self.logger.info(
+                "[CANCEL] Authorization OK: user %s canceling own appointment",
+                current_phone_norm
+            )
         
         try:
             # 1) Marcar como cancelado en BD
@@ -614,15 +715,95 @@ class Orchestrator:
                 expr_attr_values=expr_attr_values
             )
             
+            # 1.5) Limpiar reminder de la cola (GSI ApptReminderQueue)
+            self.repo.appointments.delete_reminder(
+                pk=appt['pk'],
+                sk=appt['sk'],
+                now_ms=now_ms()
+            )
+            self.logger.debug(
+                "[CANCEL] Reminder eliminado de la cola para appointment_id=%s pk=%s sk=%s",
+                appt.get('appointment_id'),
+                appt.get('pk'),
+                appt.get('sk')
+            )
+            
             # 2) Cancelar en Google Calendar
-            if appt.get('google_event_id'):
-                try:
-                    self.calendar_api.cancel_event(
-                        event_id=appt['google_event_id'],
-                        calendar_id=appt.get('google_calendar_id')
+            google_event_id = appt.get('google_event_id')
+            google_calendar_id = appt.get('google_calendar_id')
+            
+            if google_event_id:
+                # Validar que tenemos ambos IDs necesarios
+                if not google_calendar_id:
+                    # Usar customer_phone inferido (con fallback a PK)
+                    customer_phone = self._infer_appt_phone(appt)
+                    
+                    self.logger.warning(
+                        "[CANCEL] Appointment sin google_calendar_id, usando calendar por defecto: event_id=%s, appointment_id=%s, pk=%s, sk=%s, customer_phone=%s",
+                        google_event_id,
+                        appt.get('appointment_id'),
+                        appt.get('pk'),
+                        appt.get('sk'),
+                        customer_phone
                     )
-                except Exception:
-                    self.logger.exception("Error canceling in Google Calendar")
+                    
+                    # Intentar resolver calendar_id desde wa_id del customer
+                    from app.services.google_calendar_service import _resolve_calendar_id
+                    google_calendar_id = _resolve_calendar_id(wa_id=customer_phone, explicit_calendar_id=None)
+                    
+                    self.logger.debug(
+                        "[CANCEL] calendar_id resuelto: %s (desde wa_id=%s)",
+                        google_calendar_id,
+                        customer_phone
+                    )
+                
+                # Log DEBUG con ambos IDs antes de cancelar
+                self.logger.debug(
+                    "[CANCEL] Cancelando en Google Calendar: event_id=%s, calendar_id=%s, appointment_id=%s",
+                    google_event_id,
+                    google_calendar_id,
+                    appt.get('appointment_id')
+                )
+                
+                try:
+                    success = self.calendar_api.cancel_event(
+                        event_id=google_event_id,
+                        calendar_id=google_calendar_id
+                    )
+                    
+                    if success:
+                        self.logger.info(
+                            "[CANCEL] Evento cancelado exitosamente en Calendar: event_id=%s, calendar_id=%s, appointment_id=%s",
+                            google_event_id,
+                            google_calendar_id,
+                            appt.get('appointment_id')
+                        )
+                    else:
+                        # cancel_event retorna False cuando el evento no existe (404) o falla
+                        self.logger.warning(
+                            "[CANCEL] cancel_event devolvió False; revisar log de GoogleCalendarService para más detalle. event_id=%s, calendar_id=%s, appointment_id=%s",
+                            google_event_id,
+                            google_calendar_id,
+                            appt.get('appointment_id')
+                        )
+                        # Estado en Dynamo ya está actualizado, no es un error crítico
+                        
+                except Exception as e:
+                    # Error inesperado (network, auth, etc.)
+                    self.logger.exception(
+                        "[CANCEL] Error inesperado cancelando en Google Calendar: event_id=%s, calendar_id=%s, appointment_id=%s",
+                        google_event_id,
+                        google_calendar_id,
+                        appt.get('appointment_id')
+                    )
+                    # No re-raise: el estado en Dynamo ya está actualizado, la cita está cancelada
+            else:
+                self.logger.warning(
+                    "[CANCEL] Appointment sin google_event_id; no se puede borrar en Calendar. appointment_id=%s pk=%s sk=%s",
+                    appt.get('appointment_id'),
+                    appt.get('pk'),
+                    appt.get('sk')
+                )
             
             # 3) Enviar confirmación por WhatsApp
             customer_phone = appt.get('customer_phone')
@@ -701,6 +882,67 @@ class Orchestrator:
         
         return result
     
+    def _infer_appt_phone(self, appt: dict) -> str | None:
+        """
+        Infiere el teléfono del appointment desde customer_phone o derivando desde PK.
+        
+        Args:
+            appt: Dict con el appointment de Dynamo
+        
+        Returns:
+            Teléfono normalizado o None si no se puede determinar
+            
+        Notes:
+            - Primer intento: appt.get('customer_phone')
+            - Fallback: extraer desde pk = 'CUST#<phone>'
+            - Si logra derivar desde PK, intenta reparar el dato en Dynamo
+        """
+        # Primer intento: customer_phone explícito
+        appt_phone = appt.get('customer_phone')
+        if appt_phone:
+            return appt_phone
+        
+        # Fallback: derivar desde PK
+        pk = appt.get('pk', '')
+        if pk.startswith('CUST#'):
+            derived_phone = pk.split('#', 1)[1]
+            
+            self.logger.info(
+                "[CANCEL] appointment sin customer_phone; derivando desde pk: pk=%s -> phone=%s",
+                pk,
+                derived_phone
+            )
+            
+            # Intentar reparar el dato en Dynamo
+            try:
+                key = {'pk': appt['pk'], 'sk': appt['sk']}
+                self.repo.appointments.update_conditional(
+                    key=key,
+                    update_expr='SET #cp = :cp',
+                    expr_attr_names={'#cp': 'customer_phone'},
+                    expr_attr_values={':cp': derived_phone}
+                )
+                self.logger.debug(
+                    "[CANCEL] appointment reparado: customer_phone seteado desde pk (appointment_id=%s)",
+                    appt.get('appointment_id')
+                )
+            except Exception as e:
+                self.logger.warning(
+                    "[CANCEL] No pude reparar customer_phone en appointment (appointment_id=%s): %s",
+                    appt.get('appointment_id'),
+                    str(e)
+                )
+            
+            return derived_phone
+        
+        # No se pudo determinar
+        self.logger.warning(
+            "[CANCEL] No pude determinar phone desde appointment: pk=%s, customer_phone=%s",
+            pk,
+            appt_phone
+        )
+        return None
+    
     # ------------------------------------------------------------------
     def get_weather(self, city: str = "Montevideo", units: str = "metric") -> dict:
         try:
@@ -760,27 +1002,28 @@ class Orchestrator:
                         "message": "Tu cita ya estaba agendada."
                     }
 
-            # 1) Check básico de disponibilidad
-            slots = self.calendar_api.get_free_slots(
-                date_str=date,
-                slot_minutes=duration_minutes,
-                calendar_id=calendar_id,
-                wa_id=wa_id_var
-            )
-            if not slots:
-                return {
-                    "error": "slot_unavailable",
-                    "message": "Ese horario ya está ocupado. Prueba otra hora o pregúntame horarios libres.",
-                }
-
-            # 2) Crear evento en Google Calendar
-            cal_result = self.calendar_api.schedule_meeting(
-                start_dt_str=date,
-                title=event_title,
-                duration_minutes=duration_minutes,
-                wa_id=wa_id_var,
-                calendar_id=calendar_id,
-            )
+            # 1) Crear evento en Google Calendar
+            # schedule_meeting ahora verifica internamente con is_slot_free
+            # Si el slot está ocupado, lanza RuntimeError
+            try:
+                cal_result = self.calendar_api.schedule_meeting(
+                    start_dt_str=date,
+                    title=event_title,
+                    duration_minutes=duration_minutes,
+                    wa_id=wa_id_var,
+                    calendar_id=calendar_id,
+                )
+            except RuntimeError as e:
+                # Slot ocupado o error de Calendar
+                error_msg = str(e)
+                if "Slot no disponible" in error_msg or "Ya existe otro evento" in error_msg:
+                    return {
+                        "error": "slot_unavailable",
+                        "message": "Ese horario ya está ocupado. Prueba otra hora o pregúntame horarios libres.",
+                    }
+                # Otro error
+                self.logger.exception("Error creando evento en Calendar")
+                raise
 
             # 3) Crear Appointment en Dynamo
             local_tz = ZoneInfo(SETTINGS.TZ)
@@ -1015,3 +1258,404 @@ class Orchestrator:
             except Exception as e:
                 self.logger.exception("cancel_scheduled_message error")
                 return False
+
+    # ------------------------------------------------------------------
+    # Admin tools
+    # ------------------------------------------------------------------
+    
+    def admin_list_appointments(
+        self,
+        date: str | None = None,
+        status: str = "scheduled",
+        max_results: int = 50,
+    ) -> dict:
+        """
+        Lista citas en un rango de fechas con información detallada del cliente.
+        SOLO para administrador (verificado en _dispatch_tool).
+        """
+        from datetime import datetime, timedelta
+        from zoneinfo import ZoneInfo
+        from app.config.settings import SETTINGS
+        
+        # Determinar rango de fechas
+        local_tz = ZoneInfo(SETTINGS.TZ)
+        
+        if date:
+            # Parsear fecha específica (YYYY-MM-DD)
+            try:
+                from_dt = datetime.strptime(date, "%Y-%m-%d").replace(tzinfo=local_tz)
+                # Rango: 00:00:00 a 23:59:59.999 del día
+                to_dt = from_dt + timedelta(days=1) - timedelta(milliseconds=1)
+            except ValueError:
+                return {"error": "invalid_date", "message": "Formato de fecha inválido. Usa YYYY-MM-DD."}
+        else:
+            # Sin fecha: próximos 7 días desde hoy
+            now = datetime.now(local_tz)
+            from_dt = now - timedelta(days=1)  # Incluir desde ayer
+            to_dt = now + timedelta(days=7)
+        
+        # Convertir a epoch_ms UTC
+        from_ms = int(from_dt.timestamp() * 1000)
+        to_ms = int(to_dt.timestamp() * 1000)
+        
+        # Consultar Dynamo
+        try:
+            # Query GSI para obtener PKs/SKs (puede no proyectar todos los atributos)
+            sparse_appointments = self.repo.appointments.query_global_by_status(
+                status=status,
+                from_ms=from_ms,
+                to_ms=to_ms,
+                limit=max_results
+            )
+            
+            # Fetch completo de cada appointment para obtener TODOS los atributos
+            # (incluyendo google_event_id que el GSI no proyecta)
+            appointments = []
+            for sparse_appt in sparse_appointments:
+                pk = sparse_appt.get('pk')
+                sk = sparse_appt.get('sk')
+                if pk and sk:
+                    full_appt = self.repo.appointments.get_item({'pk': pk, 'sk': sk})
+                    if full_appt:
+                        # Log de diagnóstico para verificar google_event_id
+                        appt_id = full_appt.get('appointment_id')
+                        g_event_id = full_appt.get('google_event_id')
+                        self.logger.debug(
+                            "[ADMIN_LIST] Fetched appt: appointment_id=%s, google_event_id=%s, has_key=%s",
+                            appt_id,
+                            g_event_id,
+                            'google_event_id' in full_appt
+                        )
+                        appointments.append(full_appt)
+                        
+        except Exception as e:
+            self.logger.exception("admin_list_appointments query error")
+            return {"error": "query_failed", "message": str(e)}
+        
+        # Enriquecer con datos del cliente
+        result = []
+        for appt in appointments:
+            customer_phone = appt.get("customer_phone")
+            customer_name = "Desconocido"
+            
+            if customer_phone:
+                try:
+                    customer = self.repo.customers.get_by_phone(customer_phone)
+                    if customer and not customer.get("error"):
+                        customer_name = customer.get("name", "Desconocido")
+                except Exception:
+                    pass
+            
+            # Convertir epoch_ms a ISO8601 en TZ local
+            starts_at_ms = appt.get("starts_at_epoch")
+            ends_at_ms = appt.get("ends_at_epoch")
+            
+            starts_at_iso = None
+            ends_at_iso = None
+            
+            if starts_at_ms:
+                starts_dt = datetime.fromtimestamp(starts_at_ms / 1000, tz=local_tz)
+                starts_at_iso = starts_dt.isoformat()
+            
+            if ends_at_ms:
+                ends_dt = datetime.fromtimestamp(ends_at_ms / 1000, tz=local_tz)
+                ends_at_iso = ends_dt.isoformat()
+            
+            appt_dict = {
+                "appointment_id": appt.get("appointment_id"),
+                "customer_phone": customer_phone,
+                "customer_name": customer_name,
+                "title": appt.get("title"),
+                "status": appt.get("status"),
+                "starts_at": starts_at_iso,
+                "ends_at": ends_at_iso,
+                "google_event_id": appt.get("google_event_id"),
+            }
+            
+            # Log de diagnóstico del resultado final
+            self.logger.debug(
+                "[ADMIN_LIST] Result item: appointment_id=%s, google_event_id=%s",
+                appt_dict.get("appointment_id"),
+                appt_dict.get("google_event_id")
+            )
+            
+            result.append(appt_dict)
+        
+        return {"appointments": result}
+    
+    def admin_cancel_appointment(
+        self,
+        appointment_id: int | None = None,
+        google_event_id: str | None = None,
+        cancel_reason: str | None = None,
+    ) -> dict:
+        """
+        Cancela una cita específica sin importar qué cliente la tomó.
+        SOLO para administrador (verificado en _dispatch_tool).
+        Reutiliza la lógica de cancel_meeting.
+        """
+        if not google_event_id:
+            return {"error": "invalid_args", "message": "Se requiere google_event_id."}
+        
+        # Llamar a cancel_meeting que ya maneja todo el flujo
+        result = self.cancel_meeting(
+            appointment_id=appointment_id,
+            google_event_id=google_event_id,
+            cancel_reason=cancel_reason
+        )
+        
+        # Adaptar respuesta para admin
+        if result.get("error"):
+            return result
+        
+        return {
+            "appointment_id": appointment_id,
+            "google_event_id": google_event_id,
+            "status": "canceled",
+            "message": "Cita cancelada correctamente por el administrador."
+        }
+    
+    def admin_block_day(
+        self,
+        date: str,
+        period: str = "full",
+        cancel_reason: str | None = None,
+    ) -> dict:
+        """
+        Bloquea un día completo o medio día, cancelando todas las citas programadas
+        y creando un evento de bloqueo en Calendar.
+        SOLO para administrador (verificado en _dispatch_tool).
+        
+        Rangos horarios:
+        - full: 00:00 - 24:00
+        - morning: 09:00 - 13:00
+        - afternoon: 13:00 - 18:00
+        """
+        from datetime import datetime, time
+        from zoneinfo import ZoneInfo
+        from app.config.settings import SETTINGS
+        from app.utils.whatsapp_utils import send_message, get_text_message_input
+        
+        local_tz = ZoneInfo(SETTINGS.TZ)
+        
+        # Parsear fecha
+        try:
+            base_date = datetime.strptime(date, "%Y-%m-%d").replace(tzinfo=local_tz)
+        except ValueError:
+            return {"error": "invalid_date", "message": "Formato de fecha inválido. Usa YYYY-MM-DD."}
+        
+        # Determinar rango según período
+        if period == "full":
+            from_dt = base_date.replace(hour=0, minute=0, second=0, microsecond=0)
+            to_dt = base_date.replace(hour=23, minute=59, second=59, microsecond=999000)
+            block_summary = f"Bloqueo de agenda - Día completo ({date})"
+        elif period == "morning":
+            from_dt = base_date.replace(hour=9, minute=0, second=0, microsecond=0)
+            to_dt = base_date.replace(hour=13, minute=0, second=0, microsecond=0)
+            block_summary = f"Bloqueo de agenda - Mañana ({date} 09:00-13:00)"
+        elif period == "afternoon":
+            from_dt = base_date.replace(hour=13, minute=0, second=0, microsecond=0)
+            to_dt = base_date.replace(hour=18, minute=0, second=0, microsecond=0)
+            block_summary = f"Bloqueo de agenda - Tarde ({date} 13:00-18:00)"
+        else:
+            return {"error": "invalid_period", "message": "period debe ser 'full', 'morning' o 'afternoon'."}
+        
+        from_ms = int(from_dt.timestamp() * 1000)
+        to_ms = int(to_dt.timestamp() * 1000)
+        
+        # Buscar citas a cancelar
+        try:
+            # Query GSI para obtener PKs/SKs (puede no proyectar todos los atributos)
+            sparse_appointments = self.repo.appointments.query_global_by_status(
+                status="scheduled",
+                from_ms=from_ms,
+                to_ms=to_ms,
+                limit=500
+            )
+            
+            # Fetch completo de cada appointment usando PK/SK para obtener TODOS los atributos
+            # (incluyendo google_event_id que el GSI puede no proyectar)
+            appointments = []
+            for sparse_appt in sparse_appointments:
+                pk = sparse_appt.get('pk')
+                sk = sparse_appt.get('sk')
+                if pk and sk:
+                    full_appt = self.repo.appointments.get_item({'pk': pk, 'sk': sk})
+                    if full_appt:
+                        appointments.append(full_appt)
+                        
+        except Exception as e:
+            self.logger.exception("admin_block_day query error")
+            return {"error": "query_failed", "message": str(e)}
+        
+        total_found = len(appointments)
+        canceled_count = 0
+        errors = []
+        
+        default_cancel_reason = cancel_reason or "Cambios en la disponibilidad del profesional"
+        
+        # Cancelar cada cita (Dynamo + Google Calendar + WhatsApp)
+        for appt in appointments:
+            try:
+                from app.db.dynamo_client import now_ms
+                from app.utils.whatsapp_utils import send_message, get_text_message_input
+                
+                key = {'pk': appt['pk'], 'sk': appt['sk']}
+                current_now_ms = now_ms()
+                
+                # 1) Marcar como cancelada en Dynamo
+                self.repo.appointments.update_conditional(
+                    key=key,
+                    update_expr='SET #st = :st, #rs = :rs, #ua = :ua, #cr = :cr',
+                    expr_attr_names={
+                        '#st': 'status',
+                        '#rs': 'reminder_status',
+                        '#ua': 'updated_at',
+                        '#cr': 'cancel_reason'
+                    },
+                    expr_attr_values={
+                        ':st': 'canceled',
+                        ':rs': 'skipped',
+                        ':ua': current_now_ms,
+                        ':cr': default_cancel_reason
+                    }
+                )
+                
+                # 2) Limpiar reminder de la cola
+                self.repo.appointments.delete_reminder(
+                    pk=appt['pk'],
+                    sk=appt['sk'],
+                    now_ms=current_now_ms
+                )
+                
+                # 3) Cancelar en Google Calendar (copiado de cancel_meeting)
+                google_event_id = appt.get('google_event_id')
+                google_calendar_id = appt.get('google_calendar_id')
+                
+                if google_event_id:
+                    # Si falta calendar_id, resolverlo
+                    if not google_calendar_id:
+                        customer_phone = self._infer_appt_phone(appt)
+                        self.logger.warning(
+                            "[ADMIN_BLOCK] Appointment sin google_calendar_id: event_id=%s, appointment_id=%s, customer_phone=%s",
+                            google_event_id,
+                            appt.get('appointment_id'),
+                            customer_phone
+                        )
+                        from app.services.google_calendar_service import _resolve_calendar_id
+                        google_calendar_id = _resolve_calendar_id(wa_id=customer_phone, explicit_calendar_id=None)
+                    
+                    self.logger.debug(
+                        "[ADMIN_BLOCK] Cancelando en Google Calendar: event_id=%s, calendar_id=%s, appointment_id=%s",
+                        google_event_id,
+                        google_calendar_id,
+                        appt.get('appointment_id')
+                    )
+                    
+                    try:
+                        success = self.calendar_api.cancel_event(
+                            event_id=google_event_id,
+                            calendar_id=google_calendar_id
+                        )
+                        
+                        if success:
+                            self.logger.info(
+                                "[ADMIN_BLOCK] Evento cancelado en Calendar: event_id=%s, calendar_id=%s",
+                                google_event_id,
+                                google_calendar_id
+                            )
+                        else:
+                            self.logger.warning(
+                                "[ADMIN_BLOCK] cancel_event devolvió False (404 o error): event_id=%s",
+                                google_event_id
+                            )
+                    except Exception as cal_err:
+                        self.logger.exception(
+                            "[ADMIN_BLOCK] Error cancelando en Calendar: event_id=%s",
+                            google_event_id
+                        )
+                else:
+                    self.logger.warning(
+                        "[ADMIN_BLOCK] Appointment sin google_event_id, no se puede borrar en Calendar: appointment_id=%s",
+                        appt.get('appointment_id')
+                    )
+                
+                # 4) Enviar notificación por WhatsApp
+                customer_phone = self._infer_appt_phone(appt)
+                if customer_phone:
+                    try:
+                        starts_ms = appt.get('starts_at_epoch')
+                        starts_dt = datetime.fromtimestamp(starts_ms / 1000, tz=local_tz)
+                        
+                        cancel_text = (
+                            f"❌ Tu cita ha sido cancelada:\n\n"
+                            f"📅 {starts_dt.strftime('%d/%m/%Y %H:%M')}\n"
+                            f"📝 {appt.get('title', 'Cita')}\n\n"
+                            f"Motivo: {default_cancel_reason}"
+                        )
+                        
+                        send_message(get_text_message_input(customer_phone, cancel_text))
+                    except Exception:
+                        self.logger.exception("[ADMIN_BLOCK] Error enviando WhatsApp")
+                
+                canceled_count += 1
+                
+            except Exception as e:
+                self.logger.exception("[ADMIN_BLOCK] Error cancelando appointment_id=%s", appt.get("appointment_id"))
+                errors.append({
+                    "appointment_id": appt.get("appointment_id"),
+                    "error": str(e)
+                })
+        
+        # Crear evento de bloqueo en Calendar
+        block_event_id = None
+        if self.has_calendar:
+            try:
+                # Importar _resolve_calendar_id para consistencia con schedule_meeting
+                from app.services.google_calendar_service import _resolve_calendar_id
+                
+                # CRITICAL: Usar el mismo calendar_id que usa get_free_slots y schedule_meeting
+                # Esto asegura que el bloqueo sea respetado por la lógica de disponibilidad
+                # Admin no tiene wa_id especial, pero respetamos la misma lógica de resolución
+                resolved_cal_id = _resolve_calendar_id(wa_id=None, explicit_calendar_id=None)
+                
+                event_body = {
+                    'summary': block_summary,
+                    'description': f'Bloqueo administrativo. {cancel_reason or ""}',
+                    'start': {
+                        'dateTime': from_dt.isoformat(),
+                        'timeZone': str(local_tz),
+                    },
+                    'end': {
+                        'dateTime': to_dt.isoformat(),
+                        'timeZone': str(local_tz),
+                    },
+                    'status': 'confirmed',
+                    'transparency': 'opaque',  # Marca el tiempo como ocupado
+                }
+                
+                result = self.calendar_api.service.events().insert(
+                    calendarId=resolved_cal_id,
+                    body=event_body
+                ).execute()
+                
+                block_event_id = result.get('id')
+                self.logger.info(
+                    "Created block event in Calendar: event_id=%s, calendar_id=%s (%s)",
+                    block_event_id,
+                    resolved_cal_id,
+                    block_summary
+                )
+                
+            except Exception as e:
+                self.logger.exception("Error creating block event in Calendar")
+                errors.append({"calendar_block": str(e)})
+        
+        return {
+            "date": date,
+            "period": period,
+            "total_appointments": total_found,
+            "canceled_appointments": canceled_count,
+            "block_event_id": block_event_id,
+            "errors": errors if errors else None
+        }

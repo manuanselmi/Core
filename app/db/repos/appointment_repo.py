@@ -338,21 +338,32 @@ class AppointmentRepo(DynamoRepoBase):
         Args:
             pk: Partition key (CUST#<phone>)
             sk: Sort key (APPT#<starts_epoch>#<uuid>)
-            new_status: Nuevo estado ('pending', 'sent', 'cancelled')
+            new_status: Nuevo estado ('pending', 'sent', 'cancelled', 'skipped')
         
         Returns:
             Dict con la cita actualizada
             
         Notes:
             - Usado por scheduler para marcar reminders como enviados
-            - También actualiza el índice ApptReminderQueue automáticamente
+            - Limpia reminder_status_status cuando el status no es 'pending'
+            - Esto asegura que la cita salga del GSI ApptReminderQueue
         """
-        return self.update_conditional(
-            key={'pk': pk, 'sk': sk},
-            update_expr='SET #rs = :status',
-            expr_attr_names={'#rs': 'reminder_status'},
-            expr_attr_values={':status': new_status}
-        )
+        # Si el nuevo status no es 'pending', limpiar reminder_status_status para sacar de GSI
+        if new_status != 'pending':
+            return self.update_conditional(
+                key={'pk': pk, 'sk': sk},
+                update_expr='SET #rs = :status REMOVE reminder_status_status',
+                expr_attr_names={'#rs': 'reminder_status'},
+                expr_attr_values={':status': new_status}
+            )
+        else:
+            # Si vuelve a pending, mantener el comportamiento original
+            return self.update_conditional(
+                key={'pk': pk, 'sk': sk},
+                update_expr='SET #rs = :status',
+                expr_attr_names={'#rs': 'reminder_status'},
+                expr_attr_values={':status': new_status}
+            )
     
     def claim_reminder(self, pk: str, sk: str, now_ms: int) -> dict | None:
         """
@@ -501,3 +512,28 @@ class AppointmentRepo(DynamoRepoBase):
             ),
             expr_attr_values={':now': now_ms}
         )
+    
+    def delete_appointment(self, pk: str, sk: str) -> bool:
+        """
+        Elimina un appointment de Dynamo.
+        
+        Args:
+            pk: Partition key (CUST#<phone>)
+            sk: Sort key (APPT#<starts_epoch>#<uuid>)
+        
+        Returns:
+            True si se eliminó exitosamente, False en caso contrario
+            
+        Notes:
+            - Usa delete_conditional para eliminar el item de la tabla
+            - Usado para limpiar appointments canceladas
+            - El item se elimina completamente de Dynamo
+        """
+        try:
+            self.delete_conditional({'pk': pk, 'sk': sk})
+            return True
+        except ClientError as e:
+            if e.response['Error']['Code'] == 'ConditionalCheckFailedException':
+                # Item no existe o ya fue eliminado
+                return False
+            raise

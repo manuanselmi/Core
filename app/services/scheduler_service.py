@@ -468,6 +468,14 @@ def _process_appointments(repo: RepositoryProvider, rows: list[dict], now_ms: in
                             ':reason': 'Cancelado externamente (detectado al enviar recordatorio)'
                         }
                     )
+                    
+                    # Limpiar reminder de la cola (GSI ApptReminderQueue)
+                    repo.appointments.delete_reminder(
+                        pk=appt['pk'],
+                        sk=appt['sk'],
+                        now_ms=now_ms
+                    )
+                    
                     canceled_detected += 1
                     continue
             

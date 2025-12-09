@@ -187,6 +187,59 @@ class GoogleCalendarService:
         return free
 
     # ---------- Creación de evento ----------
+    def is_slot_free(
+        self,
+        start_dt: datetime,
+        end_dt: datetime,
+        wa_id: str | None = None,
+        calendar_id: str | None = None,
+    ) -> bool:
+        """Verifica si un slot específico está libre usando freebusy. Retorna True si está completamente libre."""
+        if not self.service:
+            _logger().error("[GoogleCalendarService] Calendar service not initialized")
+            return False
+        
+        # Resolver calendar_id usando la misma lógica que schedule_meeting
+        cal_id = _resolve_calendar_id(wa_id, calendar_id)
+        
+        try:
+            fb = self.service.freebusy().query(
+                body={
+                    "timeMin": start_dt.isoformat(),
+                    "timeMax": end_dt.isoformat(),
+                    "items": [{"id": cal_id}],
+                }
+            ).execute()
+            
+            busy_periods = fb["calendars"][cal_id]["busy"]
+            
+            # Si hay cualquier periodo busy que se solape, el slot NO está libre
+            if busy_periods:
+                _logger().info(
+                    "[GoogleCalendarService] Slot ocupado: %s - %s (calendar: %s, busy: %d)",
+                    start_dt.isoformat(),
+                    end_dt.isoformat(),
+                    cal_id,
+                    len(busy_periods)
+                )
+                return False
+            
+            _logger().info(
+                "[GoogleCalendarService] Slot libre: %s - %s (calendar: %s)",
+                start_dt.isoformat(),
+                end_dt.isoformat(),
+                cal_id
+            )
+            return True
+            
+        except Exception as e:
+            _logger().exception(
+                "[GoogleCalendarService] Error verificando disponibilidad: %s",
+                str(e)
+            )
+            # En caso de error, asumimos ocupado por seguridad
+            return False
+    
     def schedule_meeting(
         self,
         start_dt_str: str,
@@ -204,6 +257,13 @@ class GoogleCalendarService:
             
         start_dt = datetime.fromisoformat(start_dt_str).replace(tzinfo=LOCAL_TZ)
         end_dt = start_dt + timedelta(minutes=duration_minutes)
+        
+        # CRITICAL: Verificar que el slot esté libre ANTES de crear el evento
+        if not self.is_slot_free(start_dt, end_dt, wa_id, calendar_id):
+            raise RuntimeError(
+                f"Slot no disponible: {start_dt.isoformat()} - {end_dt.isoformat()}. "
+                "Ya existe otro evento en ese horario."
+            )
 
         body = {
             "summary": title,
@@ -239,20 +299,77 @@ class GoogleCalendarService:
     
     # ---------- Cancelación de evento ----------
     def cancel_event(self, event_id: str, calendar_id: str | None = None) -> bool:
-        """Cancela un evento en Google Calendar. Retorna True si se canceló, False si no existe."""
+        """
+        Cancela un evento en Google Calendar. Retorna True si se canceló, False si no existe.
+        
+        Args:
+            event_id: ID del evento en Google Calendar (requerido)
+            calendar_id: ID del calendario. Si es None, usa CALENDAR_ID por defecto.
+        
+        Returns:
+            True si se canceló exitosamente, False si el evento no existe (404) o hay error
+            
+        Notes:
+            - CRÍTICO: Siempre pasar calendar_id correcto desde el appointment
+            - El calendar_id debe coincidir con el usado al crear el evento
+            - NUNCA lanza excepciones; retorna False en caso de error
+            - Log exhaustivo para diagnóstico
+        """
         if not self.service:
-            _logger().error("[GoogleCalendarService] No hay servicio de calendario inicializado")
+            _logger().error("[GoogleCalendarService] ✗ No hay servicio de calendario inicializado")
             return False
         
+        # Validar que tenemos event_id
+        if not event_id:
+            _logger().error("[GoogleCalendarService] ✗ cancel_event llamado sin event_id")
+            return False
+        
+        # Usar calendar_id pasado o fallback a default
         cal_id = calendar_id or CALENDAR_ID
+        
+        # Log DEBUG con IDs completos antes de la operación
+        _logger().debug(
+            "[GoogleCalendarService] cancel_event → event_id=%s, calendar_id=%s (explicit=%s, default=%s)",
+            event_id,
+            cal_id,
+            calendar_id,
+            CALENDAR_ID
+        )
+        
         try:
             self.service.events().delete(calendarId=cal_id, eventId=event_id).execute()
+            _logger().info(
+                "[GoogleCalendarService] ✓ Evento cancelado exitosamente: event_id=%s, calendar_id=%s",
+                event_id,
+                cal_id
+            )
             return True
+            
         except Exception as e:
-            if "404" in str(e) or "not found" in str(e).lower():
+            error_str = str(e)
+            error_str_lower = error_str.lower()
+            error_type = type(e).__name__
+            
+            # Caso esperado: evento no existe (404 o notFound)
+            if "404" in error_str_lower or "not found" in error_str_lower or "notfound" in error_str_lower:
+                _logger().info(
+                    "[GoogleCalendarService] Evento no encontrado (404): event_id=%s, calendar_id=%s - probablemente ya fue borrado. error_type=%s",
+                    event_id,
+                    cal_id,
+                    error_type
+                )
                 return False
-            _logger().exception("[GoogleCalendarService] Error cancelando evento: event_id=%s", event_id)
-            raise
+            
+            # Otros errores (auth, network, permission, etc.)
+            _logger().error(
+                "[GoogleCalendarService] ✗ Error cancelando evento: type=%s event_id=%s calendar_id=%s error=%s",
+                error_type,
+                event_id,
+                cal_id,
+                error_str
+            )
+            # CRÍTICO: No re-raise para no romper UX (Dynamo ya tiene estado correcto)
+            return False
     
     # ---------- Obtención de evento ----------
     def get_event(self, event_id: str, calendar_id: str | None = None) -> dict | None:

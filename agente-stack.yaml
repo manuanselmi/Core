@@ -111,6 +111,11 @@ Parameters:
     Default: ''
     Description: (Opcional) Usuario delegado (Domain-wide delegation)
 
+  AdminWaId:
+    Type: String
+    Default: ''
+    Description: Número de WhatsApp del administrador (wa_id, solo dígitos, ej. 5989XXXXXXXX). Si está vacío, no hay admin.
+
   # ARNs de Secrets (opcionales)
 
   OpenAIApiKeySecretArn:
@@ -609,6 +614,7 @@ Resources:
           SPECIAL_WAID: !Ref SpecialWaid
           LUCAS_WAID: !Ref LucasWaid
           GOOGLE_DELEGATED_USER: !Ref GoogleDelegatedUser
+          ADMIN_WA_ID: !Ref AdminWaId
           # ARNs de secrets (opcionales; tu loader los valida)
           SM_ARN_OPENAI_API_KEY: !Ref OpenAIApiKeySecretArn
           SM_ARN_WHATSAPP_ACCESS_TOKEN: !Ref WhatsAppAccessTokenSecretArn
@@ -859,7 +865,10 @@ Resources:
       Description: !Sub
         - Stack ${AWS::StackName} Function ${ResourceName}
         - ResourceName: Function
-      CodeUri: src/Function
+      CodeUri:
+        Bucket: !Ref CodeS3Bucket
+        Key: !Ref CodeS3Key
+        Version: !Ref CodeS3ObjectVersion
       Handler: index.handler
       Runtime: nodejs22.x
       MemorySize: 3008

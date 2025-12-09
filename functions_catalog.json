@@ -232,6 +232,83 @@
         "required": [],
         "additionalProperties": false
       }
+    },
+    {
+      "type": "function",
+      "name": "admin_list_appointments",
+      "description": "Lista citas en un rango de fechas o día específico. SOLO para administrador. Devuelve información detallada de cada cita incluyendo datos del cliente.",
+      "parameters": {
+        "type": "object",
+        "properties": {
+          "date": {
+            "type": "string",
+            "description": "Fecha en formato YYYY-MM-DD (zona horaria del agente). Si se omite, usa próximos 7 días desde hoy."
+          },
+          "status": {
+            "type": "string",
+            "description": "Estado de las citas a filtrar (scheduled, canceled, etc.)",
+            "default": "scheduled"
+          },
+          "max_results": {
+            "type": "integer",
+            "description": "Cantidad máxima de citas a devolver",
+            "default": 50,
+            "minimum": 1
+          }
+        },
+        "required": [],
+        "additionalProperties": false
+      }
+    },
+    {
+      "type": "function",
+      "name": "admin_cancel_appointment",
+      "description": "Cancela una cita específica usando su google_event_id, sin importar qué cliente la tomó. SOLO para administrador. Notifica al cliente automáticamente.",
+      "parameters": {
+        "type": "object",
+        "properties": {
+          "appointment_id": {
+            "type": "string",
+            "description": "ID interno de la cita a cancelar (UUID). Opcional si se usa google_event_id."
+          },
+          "google_event_id": {
+            "type": "string",
+            "description": "ID del evento en Google Calendar a cancelar"
+          },
+          "cancel_reason": {
+            "type": "string",
+            "description": "Motivo de la cancelación que se enviará al cliente (opcional)"
+          }
+        },
+        "required": ["google_event_id"],
+        "additionalProperties": false
+      }
+    },
+    {
+      "type": "function",
+      "name": "admin_block_day",
+      "description": "Bloquea un día completo o medio día (mañana/tarde), cancelando todas las citas programadas en ese rango y creando un evento de bloqueo en Calendar. SOLO para administrador.",
+      "parameters": {
+        "type": "object",
+        "properties": {
+          "date": {
+            "type": "string",
+            "description": "Fecha a bloquear en formato YYYY-MM-DD (zona horaria del agente)"
+          },
+          "period": {
+            "type": "string",
+            "description": "Período a bloquear: 'full' (día completo), 'morning' (mañana 09:00-13:00), 'afternoon' (tarde 13:00-18:00)",
+            "default": "full",
+            "enum": ["full", "morning", "afternoon"]
+          },
+          "cancel_reason": {
+            "type": "string",
+            "description": "Motivo común que recibirán todos los clientes afectados (opcional)"
+          }
+        },
+        "required": ["date"],
+        "additionalProperties": false
+      }
     }
   ]
 }
